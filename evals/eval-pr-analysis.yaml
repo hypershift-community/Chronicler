@@ -1,0 +1,249 @@
+name: pr-analysis-eval
+description: Evaluate PR analysis quality using Sonnet for structured code review analysis, validating detection of breaking changes, API changes, impact levels, and analysis completeness
+skill: null
+
+execution:
+  mode: case
+  timeout: 120
+  max_budget_usd: 1.0
+
+runner:
+  type: claude-code
+  system_prompt: |
+    Read the input.json file in the current directory. It contains PR data
+    (metadata and optionally a diff). Analyze the PR and write a JSON analysis
+    to analysis.json with exactly these fields:
+    repo, number, author, summary, actual_changes, alignment_with_description,
+    breaking_changes, test_coverage, api_changes, files_changed,
+    notable_observations, impact_level, impact_statement.
+
+    Use the "author" field from input.json exactly. Never guess authors.
+
+    For PRs without a diff section (light mode), analyze based on title, body,
+    labels, and Jira context. Mark fields that require diff inspection as
+    "unavailable" or empty arrays where appropriate.
+
+    Write ONLY the JSON file, no other output. Do not wrap JSON in markdown
+    code fences in the file.
+
+models:
+  judge: claude-sonnet-5
+
+permissions:
+  allow:
+    - "Read"
+    - "Write"
+  deny:
+    - "Bash"
+    - "Agent"
+    - "mcp__*"
+
+mlflow:
+  experiment: pr-analysis-eval
+
+dataset:
+  path: cases/pr-analysis
+  schema: |
+    Each case directory contains:
+    - input.json: PR data with metadata and optionally diff
+    - annotations.yaml: Expected analysis outcomes with fields:
+      - 'expected_breaking_changes': true/false
+      - 'expected_api_changes': true/false
+      - 'expected_impact_level': high/medium/low
+      - 'acceptable_impact_levels': list of acceptable impact levels
+      - 'analysis_mode': "light" (optional, for metadata-only PRs)
+      - 'notes': explanation of expected analysis
+
+outputs:
+  - path: "analysis.json"
+    schema: |
+      JSON object with fields:
+      - repo: string — "owner/repo"
+      - number: integer — PR number
+      - author: string — GitHub username
+      - summary: string — one sentence describing actual code changes
+      - actual_changes: array of strings — concrete change descriptions
+      - alignment_with_description: "matches" | "partial" | "misleading"
+      - breaking_changes: array of strings (may be empty)
+      - test_coverage: string — description of test changes or "none"
+      - api_changes: boolean
+      - files_changed: object with "total" and "by_type" keys
+      - notable_observations: array of strings
+      - impact_level: "high" | "medium" | "low"
+      - impact_statement: string — one sentence business/user impact
+
+traces:
+  stdout: true
+  stderr: true
+  events: false
+  metrics: true
+
+judges:
+  - name: valid_output_json
+    description: Verify output is valid JSON with all 13 required fields and correct types
+    check: |
+      import json
+      files = outputs.get("files", {})
+      modified = outputs.get("modified_files", {})
+      all_f = {**files, **modified}
+      json_files = {k: v for k, v in all_f.items() if k.endswith("analysis.json")}
+      if not json_files:
+          return (False, "No analysis.json found")
+      content = list(json_files.values())[0]
+      try:
+          data = json.loads(content)
+      except Exception as e:
+          return (False, f"Invalid JSON: {e}")
+
+      required = {
+          "repo": str, "number": int, "author": str, "summary": str,
+          "actual_changes": list, "alignment_with_description": str,
+          "breaking_changes": list, "test_coverage": str, "api_changes": bool,
+          "files_changed": dict, "notable_observations": list,
+          "impact_level": str, "impact_statement": str
+      }
+
+      errors = []
+      for field, expected_type in required.items():
+          if field not in data:
+              errors.append(f"Missing field: {field}")
+          elif not isinstance(data[field], expected_type):
+              errors.append(f"{field} is {type(data[field]).__name__}, expected {expected_type.__name__}")
+
+      if errors:
+          return (False, "; ".join(errors))
+
+      # Verify files_changed structure
+      fc = data.get("files_changed", {})
+      if "total" not in fc or not isinstance(fc["total"], int):
+          return (False, "files_changed.total missing or not an integer")
+      if "by_type" not in fc or not isinstance(fc["by_type"], dict):
+          return (False, "files_changed.by_type missing or not a dict")
+
+      return (True, "Valid JSON with all 13 fields and correct types")
+
+  - name: breaking_changes_detection
+    description: Verify breaking_changes field is non-empty iff expected_breaking_changes is true
+    check: |
+      import json
+      ann = outputs.get("annotations", {})
+      files = outputs.get("files", {})
+      modified = outputs.get("modified_files", {})
+      all_f = {**files, **modified}
+      json_files = {k: v for k, v in all_f.items() if k.endswith("analysis.json")}
+      if not json_files:
+          return (False, "No analysis.json found")
+      content = list(json_files.values())[0]
+      try:
+          data = json.loads(content)
+      except Exception as e:
+          return (False, f"Cannot parse JSON: {e}")
+
+      expected = ann.get("expected_breaking_changes", False)
+      breaking = data.get("breaking_changes", [])
+      has_breaking = len(breaking) > 0
+
+      if expected == has_breaking:
+          status = "detected" if has_breaking else "correctly absent"
+          return (True, f"Breaking changes {status}: {breaking}")
+
+      if expected and not has_breaking:
+          return (False, f"Expected breaking changes but found none")
+      else:
+          return (False, f"Unexpected breaking changes detected: {breaking}")
+
+  - name: api_changes_detection
+    description: Verify api_changes field matches expected_api_changes
+    check: |
+      import json
+      ann = outputs.get("annotations", {})
+      files = outputs.get("files", {})
+      modified = outputs.get("modified_files", {})
+      all_f = {**files, **modified}
+      json_files = {k: v for k, v in all_f.items() if k.endswith("analysis.json")}
+      if not json_files:
+          return (False, "No analysis.json found")
+      content = list(json_files.values())[0]
+      try:
+          data = json.loads(content)
+      except Exception as e:
+          return (False, f"Cannot parse JSON: {e}")
+
+      expected = ann.get("expected_api_changes", False)
+      actual = data.get("api_changes", False)
+
+      if expected == actual:
+          return (True, f"API changes detection correct: {actual}")
+
+      return (False, f"Expected api_changes={expected}, got {actual}")
+
+  - name: impact_level_accuracy
+    description: Verify impact_level is in acceptable_impact_levels
+    check: |
+      import json
+      ann = outputs.get("annotations", {})
+      files = outputs.get("files", {})
+      modified = outputs.get("modified_files", {})
+      all_f = {**files, **modified}
+      json_files = {k: v for k, v in all_f.items() if k.endswith("analysis.json")}
+      if not json_files:
+          return (False, "No analysis.json found")
+      content = list(json_files.values())[0]
+      try:
+          data = json.loads(content)
+      except Exception as e:
+          return (False, f"Cannot parse JSON: {e}")
+
+      predicted = data.get("impact_level", "")
+      expected = ann.get("expected_impact_level", "")
+      acceptable = ann.get("acceptable_impact_levels", [expected])
+
+      if predicted in acceptable:
+          match = "exact" if predicted == expected else "acceptable"
+          return (True, f"{match}: predicted={predicted}, expected={expected}")
+
+      return (False, f"predicted={predicted}, expected={expected}, acceptable={acceptable}")
+
+  - name: analysis_quality
+    description: LLM judge assessing summary depth, actual_changes specificity, impact_statement relevance, and overall completeness
+    prompt: |
+      You are evaluating the quality of a PR analysis produced by an automated system.
+
+      The analysis output:
+
+      {% for path, content in outputs.files.items() if path.endswith('analysis.json') %}
+      {{ content }}
+      {% endfor %}
+
+      Expected outcomes from annotations:
+
+      {{ annotations }}
+
+      Evaluate on a 1-5 scale:
+
+      Score 1: Missing critical fields, generic summary ("updated code"), empty actual_changes,
+               or impact_statement that doesn't relate to the PR.
+      Score 2: Summary present but vague. actual_changes list generic items without specifics.
+               impact_statement present but doesn't clearly convey user/business value.
+      Score 3: Summary captures the main change. actual_changes list has some detail but
+               misses key aspects. impact_statement mentions the feature but is generic.
+               Breaking/API change detection is partially correct.
+      Score 4: Summary is specific and accurate. actual_changes list covers all major
+               changes with good detail. impact_statement clearly conveys user/business
+               impact. Breaking/API changes correctly identified.
+      Score 5: Excellent analysis. Summary is precise and concise. actual_changes list
+               is comprehensive and specific (e.g., file names, function signatures).
+               impact_statement captures business value in one clear sentence.
+               Breaking/API/impact correctly detected with supporting observations.
+
+thresholds:
+  valid_output_json:
+    min_pass_rate: 1.0
+  breaking_changes_detection:
+    min_pass_rate: 0.9
+  api_changes_detection:
+    min_pass_rate: 0.9
+  impact_level_accuracy:
+    min_pass_rate: 0.85
+  analysis_quality:
+    min_mean: 3.5

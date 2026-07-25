@@ -1,0 +1,6 @@
+expected_breaking_changes: true
+expected_api_changes: true
+expected_impact_level: high
+acceptable_impact_levels: [high, medium]
+analysis_mode: light
+notes: "Same PR as breaking-api-change but without diff — tests whether description alone reveals the breaking change"

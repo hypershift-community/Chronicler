@@ -15,6 +15,67 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Set, Tuple
 import subprocess
 import time
+import urllib.request
+import anthropic
+
+from textual.app import App, ComposeResult
+from textual.screen import Screen
+from textual.widgets import DataTable, Footer, Header, ProgressBar, RichLog, Static
+from textual.binding import Binding
+
+# LiteLLM pricing database URL
+LITELLM_PRICING_URL = "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
+
+# Module-level cache for pricing data
+_pricing_cache = None
+
+
+def fetch_model_pricing(model_id: str, is_vertex: bool = False) -> Optional[Dict]:
+    """Fetch pricing for a model from the LiteLLM pricing database.
+
+    Args:
+        model_id: The model identifier (e.g., 'claude-sonnet-5', 'claude-opus-4-6')
+        is_vertex: If True, looks up the Vertex AI variant (vertex_ai/{model_id})
+
+    Returns:
+        A dict with keys {'input', 'output', 'cache_write', 'cache_read'} where
+        values are cost per million tokens, or None if the model is not found
+        or the network request fails.
+    """
+    global _pricing_cache
+
+    # Fetch pricing data if not cached
+    if _pricing_cache is None:
+        try:
+            with urllib.request.urlopen(LITELLM_PRICING_URL, timeout=10) as response:
+                _pricing_cache = json.loads(response.read().decode())
+        except Exception as e:
+            print(f"Warning: Failed to fetch model pricing: {e}", file=sys.stderr)
+            return None
+
+    # Construct lookup key
+    lookup_key = f"vertex_ai/{model_id}" if is_vertex else model_id
+
+    # Try exact match first
+    if lookup_key in _pricing_cache:
+        raw = _pricing_cache[lookup_key]
+    else:
+        # Try prefix matching (e.g., claude-sonnet-5-20250514 -> claude-sonnet-5)
+        candidates = [k for k in _pricing_cache.keys() if k.startswith(lookup_key)]
+        if candidates:
+            raw = _pricing_cache[candidates[0]]
+        else:
+            print(f"Warning: Model '{lookup_key}' not found in pricing database", file=sys.stderr)
+            return None
+
+    # Extract rates and convert to cost per million tokens
+    return {
+        'input': raw.get('input_cost_per_token', 0) * 1_000_000,
+        'output': raw.get('output_cost_per_token', 0) * 1_000_000,
+        'cache_write': raw.get('cache_creation_input_token_cost', 0) * 1_000_000,
+        'cache_read': raw.get('cache_read_input_token_cost', 0) * 1_000_000,
+    }
+
 
 # API pagination and limit constants
 GITHUB_CONTRIBUTORS_PER_PAGE = 100
@@ -272,7 +333,7 @@ class JiraClient:
         _walk(adf)
         return '\n'.join(texts)
 
-    async def fetch_all_tickets(self, tickets: Set[str]) -> Dict[str, Dict]:
+    async def fetch_all_tickets(self, tickets: Set[str], progress_callback=None) -> Dict[str, Dict]:
         """Fetch all tickets in batches with rate limiting."""
         ticket_list = list(tickets)
         all_results = {}
@@ -281,13 +342,16 @@ class JiraClient:
             batch = ticket_list[i:i + JIRA_BATCH_SIZE]
             batch_num = i // JIRA_BATCH_SIZE + 1
             total_batches = (len(ticket_list) + JIRA_BATCH_SIZE - 1) // JIRA_BATCH_SIZE
-            print(f"  Fetching Jira batch {batch_num}/{total_batches} ({len(batch)} tickets)...")
+            msg = f"Jira batch {batch_num}/{total_batches} ({len(batch)} tickets)"
+            print(f"  Fetching {msg}...")
             results = await self.fetch_issues_batch(batch)
             all_results.update(results)
+            if progress_callback:
+                await progress_callback(batch_num, total_batches, msg)
 
         return all_results
 
-    async def build_hierarchy(self, tickets: Set[str]) -> Dict[str, Dict]:
+    async def build_hierarchy(self, tickets: Set[str], progress_callback=None) -> Dict[str, Dict]:
         """Build complete hierarchy including epics and OCPSTRAT parents."""
         if not tickets:
             return {}
@@ -297,11 +361,11 @@ class JiraClient:
         if HAS_AIOHTTP:
             async with aiohttp.ClientSession() as session:
                 self.session = session
-                return await self._build_hierarchy_internal(tickets)
+                return await self._build_hierarchy_internal(tickets, progress_callback=progress_callback)
         else:
-            return await self._build_hierarchy_internal(tickets)
+            return await self._build_hierarchy_internal(tickets, progress_callback=progress_callback)
 
-    async def _build_hierarchy_internal(self, tickets: Set[str]) -> Dict[str, Dict]:
+    async def _build_hierarchy_internal(self, tickets: Set[str], progress_callback=None) -> Dict[str, Dict]:
         """Internal hierarchy builder using Jira Cloud native parent field.
 
         Fetches tickets, then iteratively resolves unfetched parents by
@@ -310,8 +374,21 @@ class JiraClient:
         ticket_data: Dict[str, Dict] = {}
         queue = tickets
 
+        # Track progress by hierarchy rounds (ticket → epic → feature).
+        # Typical depth is 3 levels; we grow the estimate if needed and
+        # only report 100% after the final round completes.
+        round_num = 0
+        est_rounds = 3
+
+        async def batch_log_callback(batch_num, total_in_round, msg):
+            if progress_callback:
+                await progress_callback(round_num, est_rounds, msg)
+
         while True:
-            fetched = await self.fetch_all_tickets(queue)
+            round_num += 1
+            # Keep est_rounds > round_num so the bar never hits 100% mid-loop
+            est_rounds = max(est_rounds, round_num + 1)
+            fetched = await self.fetch_all_tickets(queue, progress_callback=batch_log_callback)
             ticket_data.update(fetched)
 
             queue = {
@@ -323,6 +400,8 @@ class JiraClient:
                 break
             print(f"  Fetching {len(queue)} parent issues...")
 
+        if progress_callback:
+            await progress_callback(round_num, round_num, f"Hierarchy complete ({round_num} rounds)")
         print(f"  Total Jira API requests: {self.request_count}")
         return self._build_hierarchy_dict(ticket_data)
 
@@ -905,11 +984,12 @@ class PRReportGenerator:
         except FileNotFoundError:
             return []
 
-    async def fetch_all_prs(self, resume: bool = False):
+    async def fetch_all_prs(self, resume: bool = False, progress_callback=None):
         """Fetch PRs from all repositories in parallel.
 
         Args:
             resume: If True, load existing data and only re-fetch repos that failed.
+            progress_callback: Optional async callback(current, total, message) for progress reporting.
         """
         # On resume, determine which repos need re-fetching
         skip_repos: Set[str] = set()
@@ -931,12 +1011,16 @@ class PRReportGenerator:
                 print("No previous fetch status found, running full fetch")
 
         print("Fetching HyperShift contributors...")
+        if progress_callback:
+            await progress_callback(0, 4, "Fetching HyperShift contributors...")
 
         # Get HyperShift contributors first
         self.hypershift_authors = await self.fetch_repository_contributors('openshift', 'hypershift')
         print(f"Found {len(self.hypershift_authors)} HyperShift contributors")
 
         print("Fetching PRs from repositories...")
+        if progress_callback:
+            await progress_callback(1, 4, f"Found {len(self.hypershift_authors)} contributors, fetching PRs...")
 
         # Build list of standard repos to fetch (excluding skipped ones)
         standard_repos = [
@@ -986,6 +1070,9 @@ class PRReportGenerator:
             if pr['author'] in self.hypershift_authors
         ]
 
+        if progress_callback:
+            await progress_callback(2, 4, "Fetched standard repos, fetching release PRs...")
+
         # Fetch openshift/release PRs filtered by HyperShift-related paths
         release_prs = []
         if 'openshift/release' not in skip_repos:
@@ -1004,13 +1091,16 @@ class PRReportGenerator:
         self._save_fetch_status()
 
         failed = [r for r, s in self.repo_fetch_status.items() if s == 'failed']
-        print(f"Found {len(new_prs)} new PRs ({len(hypershift_prs)} hypershift, {len(filtered_ai_helpers)} ai-helpers, {len(filtered_enhancements)} enhancements, {len(release_prs)} release)")
+        msg = f"Found {len(new_prs)} new PRs ({len(hypershift_prs)} hypershift, {len(filtered_ai_helpers)} ai-helpers, {len(filtered_enhancements)} enhancements, {len(release_prs)} release)"
+        print(msg)
+        if progress_callback:
+            await progress_callback(4, 4, msg)
         if existing_prs:
             print(f"Total after merge: {len(self.prs)} PRs")
         if failed:
             print(f"Failed repos: {', '.join(failed)} (re-run with --resume to retry)")
 
-    async def load_jira_hierarchy(self):
+    async def load_jira_hierarchy(self, progress_callback=None):
         """Load Jira hierarchy - either via direct API or from cache.
 
         If JIRA_EMAIL + JIRA_TOKEN are set, fetches data directly via Jira Cloud REST API.
@@ -1032,7 +1122,7 @@ class PRReportGenerator:
 
         if jira_client.enabled:
             # Fetch directly via Jira REST API
-            self.jira_hierarchy = await jira_client.build_hierarchy(all_tickets)
+            self.jira_hierarchy = await jira_client.build_hierarchy(all_tickets, progress_callback=progress_callback)
 
             # Save to cache for future runs
             jira_cache_path = os.path.join(self.output_dir, 'jira_hierarchy.json')
@@ -1971,11 +2061,12 @@ class PRReportGenerator:
         print("-" * 140)
         print(f"Selected {len(scored_prs)} PRs for deep analysis\n")
 
-    async def fetch_pr_diffs(self, pr_list: List[Tuple[str, int]]) -> Dict[str, Dict]:
+    async def fetch_pr_diffs(self, pr_list: List[Tuple[str, int]], progress_callback=None) -> Dict[str, Dict]:
         """Fetch diffs for selected PRs via GitHub REST API.
 
         Args:
             pr_list: List of (repo, pr_number) tuples
+            progress_callback: Optional async callback(current, total, message) for progress reporting.
 
         Returns:
             Dict mapping "owner_repo_number" key to diff data
@@ -2042,17 +2133,27 @@ class PRReportGenerator:
                 return {'repo': repo, 'number': number, 'error': str(e)}
 
         results = {}
+        completed = 0
+        total = len(pr_list)
+
+        async def fetch_and_report(session, repo, num):
+            nonlocal completed
+            r = await fetch_single_diff(session, repo, num)
+            completed += 1
+            if progress_callback:
+                await progress_callback(completed, total, f"Diff {completed}/{total}: {repo}#{num}")
+            return r
 
         if HAS_AIOHTTP:
             async with aiohttp.ClientSession() as session:
-                tasks = [fetch_single_diff(session, repo, num) for repo, num in pr_list]
+                tasks = [fetch_and_report(session, repo, num) for repo, num in pr_list]
                 responses = await asyncio.gather(*tasks)
                 for r in responses:
                     key = f"{r['repo'].replace('/', '_')}_{r['number']}"
                     results[key] = r
         else:
             for repo, num in pr_list:
-                r = await fetch_single_diff(None, repo, num)
+                r = await fetch_and_report(None, repo, num)
                 key = f"{repo.replace('/', '_')}_{num}"
                 results[key] = r
 
@@ -2112,6 +2213,681 @@ class PRReportGenerator:
             written += 1
 
         print(f"Wrote {written} per-PR JSON files to {output_dir}/")
+
+    async def analyze_prs_with_llm(self, deep_dir: str, metadata_keys: set = None,
+                                    analyze_keys: set = None, progress_callback=None):
+        """Analyze PR diffs using direct Anthropic API calls (Sonnet).
+
+        Args:
+            deep_dir: Directory containing PR JSON files from write_deep_pr_files()
+            metadata_keys: Set of file keys that should get metadata-only analysis (no diff in prompt)
+            analyze_keys: If set, only analyze files whose key is in this set (prevents
+                          leftover files from previous runs being analyzed). None = all files.
+            progress_callback: Optional async callback(current, total, message) for progress reporting.
+        """
+        if metadata_keys is None:
+            metadata_keys = set()
+
+        # Find PR files to analyze
+        import glob
+        pr_files = sorted(glob.glob(os.path.join(deep_dir, '*.json')))
+        pr_files = [f for f in pr_files if not f.endswith('_analysis.json')]
+
+        # Filter to only selected keys when provided
+        if analyze_keys is not None:
+            pr_files = [f for f in pr_files
+                        if os.path.basename(f).replace('.json', '') in analyze_keys]
+
+        # Skip already analyzed (resume support)
+        to_analyze = []
+        for f in pr_files:
+            analysis_path = f.replace('.json', '_analysis.json')
+            if os.path.exists(analysis_path):
+                print(f"  Skipping {os.path.basename(f)} (already analyzed)")
+            else:
+                to_analyze.append(f)
+
+        if not to_analyze:
+            print("All PRs already analyzed. Use --no-resume to re-analyze.")
+            return
+
+        # Use Vertex AI if configured, otherwise direct Anthropic API
+        vertex_project = os.environ.get('ANTHROPIC_VERTEX_PROJECT_ID') or os.environ.get('GOOGLE_CLOUD_PROJECT')
+        vertex_region = os.environ.get('CLOUD_ML_REGION', 'us-east5')
+        if vertex_project:
+            client = anthropic.AsyncAnthropicVertex(project_id=vertex_project, region=vertex_region)
+            backend = f"Vertex AI ({vertex_region})"
+        else:
+            client = anthropic.AsyncAnthropic()
+            backend = "Anthropic API"
+
+        print(f"\nAnalyzing {len(to_analyze)} PRs with Sonnet via {backend}...")
+
+        semaphore = asyncio.Semaphore(10)
+        total_input_tokens = 0
+        total_output_tokens = 0
+        total_cache_write_tokens = 0
+        total_cache_read_tokens = 0
+        actual_model = None
+
+        ANALYSIS_SYSTEM_PROMPT = """You are a code review analyst. Analyze the PR data provided and output a JSON object with exactly these fields:
+
+{
+  "repo": "owner/repo",
+  "number": 1234,
+  "author": "github-username",
+  "summary": "One sentence describing actual code changes",
+  "actual_changes": ["Change 1", "Change 2"],
+  "alignment_with_description": "matches" or "partial" or "misleading",
+  "breaking_changes": ["Breaking change 1"] or [],
+  "test_coverage": "Description of test changes" or "none",
+  "api_changes": true or false,
+  "files_changed": {"total": 5, "by_type": {"go": 3, "yaml": 2}},
+  "notable_observations": ["Observation 1"],
+  "impact_level": "high" or "medium" or "low",
+  "impact_statement": "One sentence business/user impact"
+}
+
+CRITICAL: Use the "author" field from the input data exactly. Never guess authors.
+Output ONLY the JSON object, no markdown fences, no explanation."""
+
+        async def analyze_single(filepath: str):
+            nonlocal total_input_tokens, total_output_tokens, total_cache_write_tokens, total_cache_read_tokens, actual_model
+            basename = os.path.basename(filepath)
+            key = basename.replace('.json', '')
+
+            with open(filepath) as f:
+                pr_data = json.load(f)
+
+            # For metadata-only analysis, strip the diff to save tokens
+            is_light = key in metadata_keys
+            if is_light:
+                pr_data_for_prompt = {
+                    'repo': pr_data.get('repo', ''),
+                    'number': pr_data.get('number', 0),
+                    'title': pr_data.get('title', ''),
+                    'author': pr_data.get('author', ''),
+                    'body': pr_data.get('body', ''),
+                    'labels': pr_data.get('labels', []),
+                    'jiraTickets': pr_data.get('jiraTickets', []),
+                    'jiraHierarchy': pr_data.get('jiraHierarchy', {}),
+                }
+                user_prompt = f"Analyze this PR based on its description (no diff available):\n\n{json.dumps(pr_data_for_prompt, indent=2)}"
+            else:
+                user_prompt = f"Analyze this PR diff:\n\n{json.dumps(pr_data, indent=2)}"
+
+            async with semaphore:
+                try:
+                    response = await client.messages.create(
+                        model="claude-sonnet-5",
+                        max_tokens=1024,
+                        system=ANALYSIS_SYSTEM_PROMPT,
+                        messages=[{"role": "user", "content": user_prompt}],
+                    )
+
+                    total_input_tokens += response.usage.input_tokens
+                    total_output_tokens += response.usage.output_tokens
+                    total_cache_write_tokens += getattr(response.usage, 'cache_creation_input_tokens', 0) or 0
+                    total_cache_read_tokens += getattr(response.usage, 'cache_read_input_tokens', 0) or 0
+
+                    # Capture actual model name from first successful response
+                    if actual_model is None:
+                        actual_model = response.model
+
+                    # Parse the JSON response
+                    response_text = response.content[0].text.strip()
+                    # Handle potential markdown fences
+                    if response_text.startswith('```'):
+                        response_text = response_text.split('\n', 1)[1]
+                        if response_text.endswith('```'):
+                            response_text = response_text[:-3].strip()
+
+                    analysis = json.loads(response_text)
+
+                    # Write analysis file
+                    analysis_path = filepath.replace('.json', '_analysis.json')
+                    with open(analysis_path, 'w') as f:
+                        json.dump(analysis, f, indent=2)
+
+                    mode = "L" if is_light else "D"
+                    print(f"  [{mode}] {basename}: {analysis.get('impact_level', '?')} impact - {analysis.get('summary', '?')[:60]}")
+                    return analysis
+
+                except json.JSONDecodeError as e:
+                    print(f"  ERROR {basename}: Failed to parse LLM response as JSON: {e}")
+                    return None
+                except Exception as e:
+                    print(f"  ERROR {basename}: {e}")
+                    return None
+
+        completed_count = 0
+
+        async def analyze_and_report(filepath: str):
+            nonlocal completed_count
+            result = await analyze_single(filepath)
+            completed_count += 1
+            if progress_callback:
+                await progress_callback(
+                    completed_count, len(to_analyze),
+                    f"Analyzed {os.path.basename(filepath)}"
+                )
+            return result
+
+        # Run all analyses concurrently (semaphore limits to 10 at a time)
+        results = await asyncio.gather(*[analyze_and_report(f) for f in to_analyze])
+
+        successful = [r for r in results if r is not None]
+        failed = len(results) - len(successful)
+
+        # Fetch pricing for the actual model used
+        is_vertex = vertex_project is not None
+        pricing = fetch_model_pricing(actual_model or "claude-sonnet-5", is_vertex=is_vertex)
+
+        print(f"\n  Analysis complete:")
+        print(f"    Successful: {len(successful)}/{len(results)}")
+        if failed:
+            print(f"    Failed:     {failed}")
+
+        # Display model name
+        model_display = actual_model or "claude-sonnet-5"
+        if is_vertex:
+            model_display += " (Vertex AI)"
+        print(f"    Model:      {model_display}")
+
+        # Display token counts
+        token_parts = [f"{total_input_tokens:,} input", f"{total_output_tokens:,} output"]
+        if total_cache_write_tokens > 0:
+            token_parts.append(f"{total_cache_write_tokens:,} cache write")
+        if total_cache_read_tokens > 0:
+            token_parts.append(f"{total_cache_read_tokens:,} cache read")
+        print(f"    Tokens:     {' + '.join(token_parts)}")
+
+        # Display cost estimate if pricing is available
+        if pricing:
+            input_cost = total_input_tokens * pricing['input'] / 1_000_000
+            output_cost = total_output_tokens * pricing['output'] / 1_000_000
+            cache_write_cost = total_cache_write_tokens * pricing['cache_write'] / 1_000_000
+            cache_read_cost = total_cache_read_tokens * pricing['cache_read'] / 1_000_000
+            total_cost = input_cost + output_cost + cache_write_cost + cache_read_cost
+
+            cost_parts = [f"${input_cost:.2f} input", f"${output_cost:.2f} output"]
+            if cache_write_cost > 0:
+                cost_parts.append(f"${cache_write_cost:.2f} cache write")
+            if cache_read_cost > 0:
+                cost_parts.append(f"${cache_read_cost:.2f} cache read")
+            print(f"    Est. cost:  ${total_cost:.2f} ({' + '.join(cost_parts)})")
+        else:
+            print(f"    (pricing unavailable — see https://docs.anthropic.com/en/docs/about-claude/pricing)")
+
+        # Aggregate all analyses
+        self.aggregate_analyses(deep_dir)
+
+    def aggregate_analyses(self, deep_dir: str):
+        """Aggregate all _analysis.json files into pr_deep_aggregated.json."""
+        import glob
+        from datetime import datetime
+
+        analysis_files = sorted(glob.glob(os.path.join(deep_dir, '*_analysis.json')))
+        analyses = []
+        for f in analysis_files:
+            try:
+                with open(f) as fh:
+                    analyses.append(json.load(fh))
+            except (json.JSONDecodeError, IOError) as e:
+                print(f"  Warning: Could not read {os.path.basename(f)}: {e}")
+
+        aggregated = {
+            'generated_at': datetime.utcnow().isoformat() + 'Z',
+            'prs_analyzed': len(analyses),
+            'analyses': analyses,
+            'summary': {
+                'breaking_changes_count': sum(1 for a in analyses if a.get('breaking_changes')),
+                'api_changes_count': sum(1 for a in analyses if a.get('api_changes')),
+                'high_impact_count': sum(1 for a in analyses if a.get('impact_level') == 'high'),
+            }
+        }
+
+        output_path = os.path.join(os.path.dirname(deep_dir), 'pr_deep_aggregated.json')
+        with open(output_path, 'w') as f:
+            json.dump(aggregated, f, indent=2)
+
+        print(f"\n  Aggregated {len(analyses)} analyses to {output_path}")
+        print(f"    Breaking changes: {aggregated['summary']['breaking_changes_count']}")
+        print(f"    API changes:      {aggregated['summary']['api_changes_count']}")
+        print(f"    High impact:      {aggregated['summary']['high_impact_count']}")
+
+
+BLOG_PROMPT_TEMPLATE = """You are writing a monthly progress report blog post for the HyperShift project.
+
+## Input Files
+
+Read these files to understand what happened this month:
+1. {aggregated_path} — aggregated PR analysis with per-PR summaries, breaking changes, and impact levels
+2. {blog_data_path} — contributor tables, metrics, and pre-rendered markdown sections (stats_cards, metrics_table, top_reviewers_table, contributor_table)
+
+## Style Reference
+
+Read the most recent blog post for styling reference:
+- {template_path}
+
+## Date Range
+
+Period: {start_date} to {end_date}
+Total PRs merged: {pr_count}
+Contributors: {contributor_count}
+
+## Writing Style Guide
+
+1. **Problem-first storytelling**: Don't just say what changed — explain the problem that existed before, why it mattered, and how the change addresses it. Give readers the "why" before the "what."
+
+2. **Conversational but authoritative tone**: Write like a knowledgeable engineer explaining work to interested peers over coffee. Avoid marketing language and buzzwords. Be direct, specific, and occasionally witty.
+
+3. **Technical depth with accessibility**: Go deep on the technical details — show code patterns, explain algorithms, discuss trade-offs. But structure explanations so readers can follow even if they're not experts in that specific area.
+
+4. **Historical context**: When relevant, explain what the previous approach was and why it's being changed. "The old emptyBucket function relied on X, which had problems Y and Z. The new approach does W instead."
+
+5. **Credit contributors by GitHub handle**: Use @username format, sourced from the `author` field in the PR data JSON. NEVER guess or infer authors from PR descriptions or code content.
+
+6. **Thematic grouping over chronological listing**: Group related changes into coherent narratives rather than listing PRs in order. A single section might cover 1-3 related PRs that tell one story.
+
+7. **Highlight interesting edge cases and trade-offs**: Readers love learning about subtle problems — TLS ServerName workarounds, race conditions, pre-stable dependencies. These are what make the report worth reading beyond just a changelog.
+
+8. **Don't cover everything**: Select 5-8 of the most interesting/impactful changes for deep narrative treatment. Minor fixes and routine maintenance can be briefly mentioned or grouped into a "Beneath the Headlines" section.
+
+## Instructions
+
+Follow the structure, formatting, and MkDocs Material styling from the style reference template exactly. Pre-rendered markdown sections in blog_data.json (stats_cards, metrics_table, top_reviewers_table, contributor_table) should be inserted verbatim.
+
+The output file is docs/content/blog/{blog_filename}.
+
+### Phase 0: Story selection (interactive)
+
+Read the input files. Then propose candidate stories in two tiers:
+
+**Deep stories** (5-8 candidates for full narrative treatment — 3-8 paragraphs each):
+```
+1. [Title] — [one-sentence pitch explaining why it's interesting] (PRs: #NNN, #NNN)
+2. ...
+```
+
+**Beneath the Headlines** (5-10 candidates for paragraph-length coverage):
+```
+A. [Title] — [one-sentence pitch] (PRs: #NNN)
+B. ...
+```
+
+After listing them, ask the user which deep stories to develop and which smaller items to include (e.g. "Develop deep stories 1,3,5,7 and beneath-the-headlines A,C,D,F?"). Wait for the user's selection before proceeding.
+
+### Phase 1: Write the blog post
+
+Based on the user's story selection, write the full blog post following the Writing Style Guide above and the structure from the style reference template. Write directly to docs/content/blog/{blog_filename}.
+
+### Phase 2: Update site navigation
+
+1. Update docs/content/blog/index.md — add new card entry at the TOP of the grid (after the opening `<div class="grid cards" markdown>` line), using this template:
+
+    -   :material-newspaper-variant-outline:{{{{ .lg .middle }}}} **[Month] [Year] Progress Report**
+
+        ---
+
+        [Description matching the frontmatter description]. [N] PRs from [N] contributors.
+
+        [:octicons-arrow-right-24: Read the report]({blog_filename})
+
+2. Update docs/mkdocs.yml — add new blog entry to nav after blog/index.md, before older entries.
+
+### Phase 3: Preview
+
+1. Run `make docs-aggregate`
+2. Start `cd docs && mkdocs serve` for user preview
+3. Iterate with the user on edits
+
+## Sensitive Content Filtering (blog is public)
+
+- S360 references → "compliance"
+- Remove SFDC case count/link references
+- Don't include internal-only Jira links
+- Don't mention specific customer names
+"""
+
+
+class SelectionScreen(Screen):
+    """Interactive PR selection screen used both standalone and inside PipelineApp.
+
+    Categories:
+      D = Deep:     fetch diff + LLM analysis now
+      Z = Lazy:     fetch diff now, LLM analysis deferred
+      M = Metadata: no diff, LLM analyzes description only
+      I = Ignore:   skip entirely
+    """
+
+    CSS = """
+    DataTable {
+        height: 1fr;
+    }
+    #status-bar {
+        dock: bottom;
+        height: 1;
+        background: $accent;
+        color: $text;
+        padding: 0 1;
+    }
+    """
+
+    BINDINGS = [
+        Binding("d", "set_category('D')", "Deep", show=True),
+        Binding("z", "set_category('Z')", "Lazy", show=True),
+        Binding("m", "set_category('M')", "Metadata", show=True),
+        Binding("i", "set_category('I')", "Ignore", show=True),
+        Binding("enter", "confirm", "Confirm", show=True, priority=True),
+        Binding("q", "cancel", "Cancel", show=True),
+    ]
+
+    def __init__(self, scored_prs: list):
+        super().__init__()
+        self.scored_prs = scored_prs
+        self.categories = {}
+        self._col_keys = None
+        for pr in scored_prs:
+            key = f"{pr['repo']}#{pr['number']}"
+            score = pr.get('score', 0)
+            if score >= 50:
+                self.categories[key] = 'D'
+            elif score >= 10:
+                self.categories[key] = 'Z'
+            else:
+                self.categories[key] = 'I'
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield DataTable(id="pr-table")
+        yield Static(id="status-bar")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        table = self.query_one(DataTable)
+        table.cursor_type = "row"
+        self._col_keys = table.add_columns("Cat", "Score", "Priority", "Repo", "PR#", "Author", "Title")
+        for pr in self.scored_prs:
+            key = f"{pr['repo']}#{pr['number']}"
+            cat = self.categories[key]
+            repo_short = pr['repo'].split('/')[-1] if '/' in pr['repo'] else pr['repo']
+            table.add_row(
+                cat,
+                str(pr.get('score', 0)),
+                pr.get('priority', '-'),
+                repo_short,
+                str(pr['number']),
+                pr.get('author', ''),
+                pr.get('title', '')[:80],
+                key=key,
+            )
+        self._update_status()
+
+    def action_set_category(self, category: str) -> None:
+        table = self.query_one(DataTable)
+        if table.cursor_row is not None:
+            row_key, _ = table.coordinate_to_cell_key(table.cursor_coordinate)
+            key = row_key.value
+            self.categories[key] = category
+            table.update_cell(row_key, self._col_keys[0], category)
+            if table.cursor_row < table.row_count - 1:
+                table.move_cursor(row=table.cursor_row + 1)
+            self._update_status()
+
+    def _update_status(self) -> None:
+        counts = {'D': 0, 'Z': 0, 'M': 0, 'I': 0}
+        for cat in self.categories.values():
+            counts[cat] = counts.get(cat, 0) + 1
+        est_cost = counts['D'] * 0.03 + counts['M'] * 0.003
+        status = self.query_one("#status-bar", Static)
+        status.update(
+            f"  D(eep): {counts['D']}  Z(lazy): {counts['Z']}  "
+            f"M(etadata): {counts['M']}  I(gnore): {counts['I']}  │  "
+            f"Est. LLM cost: ~${est_cost:.2f}  │  Enter=confirm  q=cancel"
+        )
+
+    def action_confirm(self) -> None:
+        result = {'deep': [], 'lazy': [], 'metadata': [], 'ignore': []}
+        for pr in self.scored_prs:
+            key = f"{pr['repo']}#{pr['number']}"
+            cat = self.categories.get(key, 'I')
+            if cat == 'D':
+                result['deep'].append(pr)
+            elif cat == 'Z':
+                result['lazy'].append(pr)
+            elif cat == 'M':
+                result['metadata'].append(pr)
+            else:
+                result['ignore'].append(pr)
+        self.dismiss(result)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class PRSelectorApp(App):
+    """Standalone app wrapper around SelectionScreen (kept for backwards compat)."""
+
+    def __init__(self, scored_prs: list):
+        super().__init__()
+        self.scored_prs = scored_prs
+        self.result = None
+
+    def on_mount(self) -> None:
+        def handle_result(result):
+            self.result = result
+            self.exit(result)
+        self.push_screen(SelectionScreen(self.scored_prs), handle_result)
+
+
+class PipelineApp(App):
+    """Full-pipeline TUI: fetching → Jira → reports → selection → diffs → LLM."""
+
+    CSS = """
+    #phase-label {
+        height: 1;
+        padding: 0 1;
+        background: $accent;
+        color: $text;
+    }
+    #progress {
+        height: 1;
+        margin: 0 1;
+    }
+    #log {
+        height: 1fr;
+    }
+    """
+
+    BINDINGS = [
+        Binding("ctrl+c", "quit", "Quit", show=False),
+    ]
+
+    def __init__(self, generator: 'PRReportGenerator', args):
+        super().__init__()
+        self.generator = generator
+        self.args = args
+        self.pipeline_result = None
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Static("Initializing...", id="phase-label")
+        yield ProgressBar(id="progress", total=100)
+        yield RichLog(id="log", highlight=True, markup=True)
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.run_worker(self._run_pipeline(), exclusive=True)
+
+    def _set_phase(self, phase: str, total: int = 100) -> None:
+        self.query_one("#phase-label", Static).update(f"[bold]{phase}[/bold]")
+        pb = self.query_one("#progress", ProgressBar)
+        pb.total = total
+        pb.progress = 0
+
+    def _log(self, message: str) -> None:
+        self.query_one(RichLog).write(message)
+
+    def _make_callback(self):
+        async def callback(current: int, total: int, message: str) -> None:
+            pb = self.query_one("#progress", ProgressBar)
+            pb.total = total
+            pb.progress = current
+            self.query_one(RichLog).write(message)
+        return callback
+
+    async def _run_pipeline(self) -> None:
+        args = self.args
+        generator = self.generator
+        output_dir = args.output_dir
+
+        try:
+            # Phase 1: Fetch PRs
+            self._set_phase("Fetching PRs", total=4)
+            self._log("Starting PR fetch...")
+            await generator.fetch_all_prs(
+                resume=args.resume,
+                progress_callback=self._make_callback(),
+            )
+            self._log(f"[green]✓[/green] Fetched {len(generator.prs)} PRs total")
+
+            # Phase 2: Jira hierarchy
+            self._set_phase("Loading Jira hierarchy")
+            await generator.load_jira_hierarchy(
+                progress_callback=self._make_callback(),
+            )
+            self._log(f"[green]✓[/green] Loaded {len(generator.jira_hierarchy)} Jira entries")
+
+            # Phase 3: Generate reports (sync, fast)
+            self._set_phase("Generating reports")
+            generator.generate_report(os.path.join(output_dir, 'weekly_pr_report_fast.md'))
+            generator.save_raw_data(os.path.join(output_dir, 'hypershift_pr_details_fast.json'))
+            generator.save_summary_data(os.path.join(output_dir, 'hypershift_pr_summary.json'))
+            if args.blog_data:
+                generator.generate_blog_data(output_dir)
+            self._log("[green]✓[/green] Reports generated")
+
+            # Phase 4: PR Selection
+            #
+            # Categories:
+            #   D (Deep):     fetch diff + full LLM analysis now
+            #   Z (Lazy):     fetch diff + metadata-only LLM analysis now;
+            #                 diff on disk for deeper pass if blog selects it
+            #   M (Metadata): no diff, metadata-only LLM analysis
+            #   I (Ignore):   skip entirely
+            metadata_keys: set = set()  # keys getting metadata-only analysis (Z + M)
+            analyze_keys: set | None = None  # keys to analyze (D + Z + M); None = all files
+            diff_prs: list = []  # PR identifiers needing diff fetch (D + Z)
+            deep_prs: list = args.deep or []
+
+            if args.select:
+                self._set_phase("PR Selection (interactive)")
+                all_scored = generator.score_prs_for_deep_analysis(limit=len(generator.prs))
+                selections = await self.push_screen_wait(SelectionScreen(all_scored))
+                if selections is None:
+                    self._log("[yellow]Selection cancelled[/yellow]")
+                    self.exit(None)
+                    return
+
+                deep_selected = selections['deep']
+                lazy_selected = selections['lazy']
+                metadata_selected = selections['metadata']
+                self._log(
+                    f"[green]✓[/green] Selected: {len(deep_selected)} deep, "
+                    f"{len(lazy_selected)} lazy, {len(metadata_selected)} metadata, "
+                    f"{len(selections['ignore'])} ignored"
+                )
+
+                # Deep + Lazy both need diffs fetched
+                deep_prs = [f"{pr['repo']}#{pr['number']}" for pr in deep_selected]
+                lazy_ids = [f"{pr['repo']}#{pr['number']}" for pr in lazy_selected]
+                diff_prs = deep_prs + lazy_ids
+
+                # Track which keys get analyzed and which use metadata-only
+                analyze_keys = set()
+                for pr in deep_selected:
+                    analyze_keys.add(f"{pr['repo'].replace('/', '_')}_{pr['number']}")
+                for pr in lazy_selected:
+                    key = f"{pr['repo'].replace('/', '_')}_{pr['number']}"
+                    analyze_keys.add(key)
+                    metadata_keys.add(key)
+
+                # Metadata PRs: save description-only files for analysis
+                deep_dir = os.path.join(output_dir, 'pr_deep')
+                os.makedirs(deep_dir, exist_ok=True)
+                for pr in metadata_selected:
+                    key = f"{pr['repo'].replace('/', '_')}_{pr['number']}"
+                    meta_path = os.path.join(deep_dir, f"{key}.json")
+                    if not os.path.exists(meta_path):
+                        meta_data = {
+                            'repo': pr['repo'],
+                            'number': pr['number'],
+                            'title': pr['title'],
+                            'url': pr.get('url', ''),
+                            'author': pr['author'],
+                            'body': pr.get('body', ''),
+                            'labels': pr.get('labels', []),
+                            'jiraTickets': pr.get('jiraTickets', []),
+                            'mergedAt': pr.get('mergedAt', ''),
+                            'jiraHierarchy': {},
+                        }
+                        for ticket in pr.get('jiraTickets', []):
+                            if ticket in generator.jira_hierarchy:
+                                meta_data['jiraHierarchy'][ticket] = generator.jira_hierarchy[ticket]
+                        with open(meta_path, 'w') as f:
+                            json.dump(meta_data, f, indent=2)
+                    analyze_keys.add(key)
+                    metadata_keys.add(key)
+            else:
+                diff_prs = deep_prs
+
+            # Phase 5: Fetch diffs (Deep + Lazy)
+            if diff_prs:
+                pr_list = generator.parse_pr_identifiers(diff_prs)
+                if pr_list:
+                    self._set_phase("Fetching diffs", total=len(pr_list))
+                    diffs = await generator.fetch_pr_diffs(
+                        pr_list,
+                        progress_callback=self._make_callback(),
+                    )
+                    deep_dir = os.path.join(output_dir, 'pr_deep')
+                    generator.write_deep_pr_files(diffs, output_dir=deep_dir)
+                    successful = {k: v for k, v in diffs.items() if 'error' not in v}
+                    self._log(f"[green]✓[/green] Fetched {len(successful)}/{len(diffs)} diffs")
+
+            # Phase 6: LLM analysis (Deep + Lazy + Metadata; not Ignore)
+            if args.analyze:
+                if not diff_prs and not args.select:
+                    self._log("[red]Error: --analyze requires --deep or --select[/red]")
+                    self.exit(None)
+                    return
+                deep_dir = os.path.join(output_dir, 'pr_deep')
+                if not os.path.exists(deep_dir):
+                    self._log(f"[red]Error: {deep_dir} not found. Run with --deep first.[/red]")
+                    self.exit(None)
+                    return
+                self._set_phase("LLM Analysis")
+                await generator.analyze_prs_with_llm(
+                    deep_dir,
+                    metadata_keys=metadata_keys,
+                    analyze_keys=analyze_keys,
+                    progress_callback=self._make_callback(),
+                )
+                self._log("[green]✓[/green] LLM analysis complete")
+
+            # Done
+            self._set_phase("Done")
+            pb = self.query_one("#progress", ProgressBar)
+            pb.progress = pb.total
+            self._log("[green][bold]Pipeline complete![/bold][/green]")
+            self.pipeline_result = {'deep_prs': deep_prs, 'metadata_keys': metadata_keys}
+            self.exit(self.pipeline_result)
+
+        except Exception as e:
+            import traceback as _tb
+            self._log(f"[red]Error: {e}[/red]")
+            self._log(_tb.format_exc())
 
 
 def _valid_date(value: str) -> str:
@@ -2205,6 +2981,21 @@ Scoring criteria (higher = more important):
         action='store_true',
         help='Generate blog_data.json with contributor table, metrics, and pre-rendered markdown'
     )
+    parser.add_argument(
+        '--analyze',
+        action='store_true',
+        help='Run LLM analysis (Sonnet) on PR diffs. Requires ANTHROPIC_API_KEY env var'
+    )
+    parser.add_argument(
+        '--select',
+        action='store_true',
+        help='Launch interactive TUI to select PRs for deep/light/ignore analysis'
+    )
+    parser.add_argument(
+        '--blog',
+        action='store_true',
+        help='After data generation, exec into a clean Claude Code session for blog writing'
+    )
     return parser.parse_args()
 
 
@@ -2214,95 +3005,165 @@ async def main():
     args = parse_args()
     since_date = args.since_date
     end_date = args.end_date
-    deep_prs = args.deep or []
-    score_mode = args.score
-    score_limit = args.score_limit
     output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)
 
-    resume = args.resume
-    blog_data = args.blog_data
-
-    print(f"Generating PR report for: {since_date} to {end_date}")
-    print(f"Using {'async (aiohttp)' if HAS_AIOHTTP else 'sync (requests)'} mode")
-    if resume:
-        print("Resume mode: will re-fetch only repos that failed previously")
-    if deep_prs:
-        print(f"Deep mode: will fetch diffs for {len(deep_prs)} PRs")
-    if score_mode:
-        print(f"Score mode: will output top {score_limit} PRs by importance")
-    if blog_data:
-        print("Blog data mode: will generate blog_data.json")
-    print()
-
     generator = PRReportGenerator(since_date, end_date, output_dir=output_dir)
 
-    # Fetch all data
-    await generator.fetch_all_prs(resume=resume)
-    await generator.load_jira_hierarchy()
+    if args.select:
+        # TUI mode: full pipeline in a single Textual app window
+        app = PipelineApp(generator, args)
+        result = await app.run_async()
+        if result is None:
+            sys.exit(0)
+        elapsed = time.time() - start_time
+        print(f"\nData generation done in {elapsed:.2f} seconds.")
+    else:
+        # Headless mode: existing print-based flow (suitable for CI/scripting)
+        deep_prs = args.deep or []
+        score_mode = args.score
+        score_limit = args.score_limit
 
-    # Generate outputs
-    generator.generate_report(os.path.join(output_dir, 'weekly_pr_report_fast.md'))
-    generator.save_raw_data(os.path.join(output_dir, 'hypershift_pr_details_fast.json'))
-    generator.save_summary_data(os.path.join(output_dir, 'hypershift_pr_summary.json'))
+        print(f"Generating PR report for: {since_date} to {end_date}")
+        print(f"Using {'async (aiohttp)' if HAS_AIOHTTP else 'sync (requests)'} mode")
+        if args.resume:
+            print("Resume mode: will re-fetch only repos that failed previously")
+        if deep_prs:
+            print(f"Deep mode: will fetch diffs for {len(deep_prs)} PRs")
+        if score_mode:
+            print(f"Score mode: will output top {score_limit} PRs by importance")
+        if args.blog_data:
+            print("Blog data mode: will generate blog_data.json")
+        if args.analyze:
+            print("Analyze mode: will run LLM analysis on PR diffs")
+        if args.blog:
+            print("Blog mode: will exec into Claude Code for blog writing after data generation")
+        print()
 
-    # Blog data mode: generate contributor table, metrics, and pre-rendered markdown
-    if blog_data:
-        generator.generate_blog_data(output_dir)
+        await generator.fetch_all_prs(resume=args.resume)
+        await generator.load_jira_hierarchy()
 
-    # Score mode: output scored PR list
-    if score_mode:
-        scored_prs = generator.score_prs_for_deep_analysis(limit=score_limit)
-        generator.print_scored_prs(scored_prs)
+        generator.generate_report(os.path.join(output_dir, 'weekly_pr_report_fast.md'))
+        generator.save_raw_data(os.path.join(output_dir, 'hypershift_pr_details_fast.json'))
+        generator.save_summary_data(os.path.join(output_dir, 'hypershift_pr_summary.json'))
 
-        # Also save to JSON for programmatic use
-        scored_output = [{
-            'repo': pr['repo'],
-            'number': pr['number'],
-            'author': pr['author'],
-            'title': pr['title'],
-            'score': pr['score'],
-            'score_reasons': pr['score_reasons'],
-            'pr_id': f"{pr['repo']}#{pr['number']}"
-        } for pr in scored_prs]
+        if args.blog_data:
+            generator.generate_blog_data(output_dir)
 
-        scored_path = os.path.join(output_dir, 'pr_scored.json')
-        with open(scored_path, 'w') as f:
-            json.dump(scored_output, f, indent=2)
-        print(f"Scored PRs saved to {scored_path}")
+        if score_mode:
+            scored_prs = generator.score_prs_for_deep_analysis(limit=score_limit)
+            generator.print_scored_prs(scored_prs)
 
-        # Print PR list ready for --deep flag
-        print("\nPR list for --deep flag:")
-        print(' '.join([pr['pr_id'] for pr in scored_output]))
+            scored_output = [{
+                'repo': pr['repo'],
+                'number': pr['number'],
+                'author': pr['author'],
+                'title': pr['title'],
+                'score': pr['score'],
+                'score_reasons': pr['score_reasons'],
+                'pr_id': f"{pr['repo']}#{pr['number']}"
+            } for pr in scored_prs]
 
-    # Deep mode: fetch diffs for specified PRs
-    if deep_prs:
-        pr_list = generator.parse_pr_identifiers(deep_prs)
-        if pr_list:
-            print(f"\nFetching diffs for {len(pr_list)} PRs...")
-            diffs = await generator.fetch_pr_diffs(pr_list)
+            scored_path = os.path.join(output_dir, 'pr_scored.json')
+            with open(scored_path, 'w') as f:
+                json.dump(scored_output, f, indent=2)
+            print(f"Scored PRs saved to {scored_path}")
+
+            print("\nPR list for --deep flag:")
+            print(' '.join([pr['pr_id'] for pr in scored_output]))
+
+        if deep_prs:
+            pr_list = generator.parse_pr_identifiers(deep_prs)
+            if pr_list:
+                print(f"\nFetching diffs for {len(pr_list)} PRs...")
+                diffs = await generator.fetch_pr_diffs(pr_list)
+                deep_dir = os.path.join(output_dir, 'pr_deep')
+                generator.write_deep_pr_files(diffs, output_dir=deep_dir)
+
+                successful = {k: v for k, v in diffs.items() if 'error' not in v}
+                failed = {k: v for k, v in diffs.items() if 'error' in v}
+                total_additions = sum(d.get('total_additions', 0) for d in successful.values())
+                total_deletions = sum(d.get('total_deletions', 0) for d in successful.values())
+                total_files = sum(d.get('total_files', 0) for d in successful.values())
+                total_patches = sum(len(d.get('files', [])) for d in successful.values())
+                vendor_skipped = total_files - total_patches
+
+                print(f"\n  Deep analysis summary:")
+                print(f"    PRs fetched:    {len(successful)}/{len(diffs)}")
+                print(f"    Total files:    {total_files} ({vendor_skipped} vendor files skipped)")
+                print(f"    Lines changed:  +{total_additions} -{total_deletions}")
+                if failed:
+                    print(f"    Failed:         {', '.join(v.get('error', '?') for v in failed.values())}")
+
+        if args.analyze:
+            if not deep_prs:
+                print("Error: --analyze requires --deep to specify PRs")
+                sys.exit(1)
             deep_dir = os.path.join(output_dir, 'pr_deep')
-            generator.write_deep_pr_files(diffs, output_dir=deep_dir)
+            if not os.path.exists(deep_dir):
+                print(f"Error: {deep_dir} not found. Run with --deep first.")
+                sys.exit(1)
+            await generator.analyze_prs_with_llm(deep_dir)
 
-            # Print deep analysis summary
-            successful = {k: v for k, v in diffs.items() if 'error' not in v}
-            failed = {k: v for k, v in diffs.items() if 'error' in v}
-            total_additions = sum(d.get('total_additions', 0) for d in successful.values())
-            total_deletions = sum(d.get('total_deletions', 0) for d in successful.values())
-            total_files = sum(d.get('total_files', 0) for d in successful.values())
-            total_patches = sum(len(d.get('files', [])) for d in successful.values())
-            vendor_skipped = total_files - total_patches
+        elapsed = time.time() - start_time
+        print(f"\nDone in {elapsed:.2f} seconds!")
 
-            print(f"\n  Deep analysis summary:")
-            print(f"    PRs fetched:    {len(successful)}/{len(diffs)}")
-            print(f"    Total files:    {total_files} ({vendor_skipped} vendor files skipped)")
-            print(f"    Lines changed:  +{total_additions} -{total_deletions}")
-            if failed:
-                print(f"    Failed:         {', '.join(v.get('error', '?') for v in failed.values())}")
+    # Blog mode: exec into clean Claude Code session (works after both TUI and headless)
+    if args.blog:
+        import glob as _glob
 
-    elapsed = time.time() - start_time
-    print(f"\nDone in {elapsed:.2f} seconds!")
+        aggregated_path = os.path.join(output_dir, 'pr_deep_aggregated.json')
+        blog_data_path = os.path.join(output_dir, 'blog_data.json')
+
+        # Verify required files exist
+        missing = []
+        if not os.path.exists(aggregated_path):
+            missing.append(f"  - {aggregated_path} (run with --analyze)")
+        if not os.path.exists(blog_data_path):
+            missing.append(f"  - {blog_data_path} (run with --blog-data)")
+        if missing:
+            print(f"\nError: Missing required files for blog generation:")
+            print('\n'.join(missing))
+            sys.exit(1)
+
+        # Find the most recent blog post as style reference
+        blog_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                'docs', 'content', 'blog')
+        existing_blogs = sorted(_glob.glob(os.path.join(blog_dir, '*-progress-report.md')))
+        template_path = existing_blogs[-1] if existing_blogs else 'docs/content/blog/2026-06-progress-report.md'
+
+        # Get stats from blog_data.json
+        with open(blog_data_path) as f:
+            blog_data = json.load(f)
+        pr_count = blog_data.get('stats', {}).get('total_prs', '?')
+        contributor_count = blog_data.get('stats', {}).get('contributor_count', '?')
+
+        # Build blog filename from dates
+        end_dt = datetime.strptime(end_date, '%Y-%m-%d')
+        blog_filename = f"{end_dt.strftime('%Y-%m')}-progress-report.md"
+
+        prompt = BLOG_PROMPT_TEMPLATE.format(
+            aggregated_path=aggregated_path,
+            blog_data_path=blog_data_path,
+            template_path=template_path,
+            start_date=since_date,
+            end_date=end_date,
+            pr_count=pr_count,
+            contributor_count=contributor_count,
+            blog_filename=blog_filename,
+        )
+
+        print(f"Launching Claude Code for blog writing...")
+        print(f"  Aggregated analysis: {aggregated_path}")
+        print(f"  Blog data: {blog_data_path}")
+        print(f"  Style reference: {template_path}")
+
+        os.execvp('claude', ['claude', prompt])
+
+
+def cli():
+    asyncio.run(main())
 
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    cli()

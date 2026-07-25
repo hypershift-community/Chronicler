@@ -1,0 +1,5 @@
+expected_breaking_changes: true
+expected_api_changes: true
+expected_impact_level: high
+acceptable_impact_levels: [high, medium]
+notes: "Azure scale-from-zero with new InstanceTypeProvider interface — API change + behavioral change"

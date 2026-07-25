@@ -5,6 +5,9 @@ description = "Repository metrics and analysis tools"
 requires-python = ">=3.9"
 dependencies = [
     "PyYAML>=6.0",
+    "aiohttp>=3.9",
+    "textual>=3.0",
+    "anthropic[vertex]>=0.52",
 ]
 
 [project.optional-dependencies]
@@ -12,12 +15,15 @@ dev = [
     "pytest>=7.0.0",
 ]
 
+[project.scripts]
+pr-report = "weekly_pr_report:cli"
+
 [build-system]
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-py-modules = ["ai_assisted_commits"]
+py-modules = ["ai_assisted_commits", "weekly_pr_report"]
 
 [tool.pytest.ini_options]
 testpaths = ["."]

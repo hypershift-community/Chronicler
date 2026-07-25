@@ -1,0 +1,5 @@
+expected_breaking_changes: false
+expected_api_changes: true
+expected_impact_level: medium
+acceptable_impact_levels: [medium, high]
+notes: "New optional API fields (V4InternalSubnet, V6InternalSubnet) — additive, not breaking"

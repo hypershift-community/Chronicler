@@ -1,0 +1,5 @@
+expected_breaking_changes: false
+expected_api_changes: false
+expected_impact_level: low
+acceptable_impact_levels: [low, medium]
+notes: "Documentation-only PR — no breaking changes expected"

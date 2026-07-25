@@ -1,0 +1,43 @@
+{
+  "repo": "openshift/hypershift",
+  "number": 8337,
+  "title": "CNTRLPLANE-2262: Add Azure scale-from-zero support",
+  "url": "https://github.com/openshift/hypershift/pull/8337",
+  "author": "jhjaggars",
+  "body": "Extend the existing scale-from-zero autoscaling framework to support Azure by implementing an Azure instance type provider that queries the Azure Resource SKUs API for VM size specifications and writing capacity annotations on MachineDeployments.\r\n\r\nChanges:\r\n- Add Azure instancetype.Provider using armcompute.ResourceSKUsClient\r\n- Add AzureMachineTemplate case to scale_from_zero.go type switch\r\n- Extend supportedScaleFromZeroPlatform() for Azure\r\n- Extend reconcileScaleFromZeroAnnotations() for Azure\r\n- Update autoscalerEnabledCondition() to accept Azure with min=0\r\n- Update effectiveMin guard in capi.go to allow min=0 for Azure\r\n- Add \"azure\" to supportedProviders in main.go and install.go\r\n- Add Azure provider initialization with credential file parsing\r\n- Update CRD CEL validation to allow min=0 for Azure platform\r\n- Add unit tests for Azure provider and extended type switches\r\n\r\n<!--\r\nPlease follow our contributing guidelines located at https://github.com/openshift/hypershift/blob/main/.github/CONTRIBUTING.md.\r\n\r\nIn general, please:\r\n- open the PR in draft mode\r\n- keep commits as small and focused on specific changes as much as possible\r\n- use conventional commits\r\n- test your changes locally with `make pre-commit` before moving any PR out of draft mode\r\n- prefix your PR with a Jira ticket number\r\n- fill out the PR description template below\r\n\r\nFeel free to delete this comment text block before submitting the PR.\r\n-->\r\n\r\n## What this PR does / why we need it:\r\n\r\n## Which issue(s) this PR fixes:\r\n<!--\r\n(optional, use `fixes #<issue_number>(, fixes #<issue_number>, ...)` format, where issue_number might be a GitHub issue, or a Jira story\r\n-->\r\nFixes \r\n\r\n## Special notes for your reviewer:\r\n\r\n## Checklist:\r\n- [ ] Subject and description added to both, commit and PR.\r\n- [ ] Relevant issues have been referenced.\r\n- [ ] This change includes docs. \r\n- [ ] This change includes unit tests.\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai -->\n## Summary by CodeRabbit\n\n* **New Features**\n  * Scale-from-zero autoscaling now supported on Azure as well as AWS; operator/CLI accept Azure as a provider and use Azure SKU data for instance-type info.\n\n* **Bug Fixes**\n  * Replica and autoscaler behavior updated so min=0 is honored for Azure where supported.\n\n* **Documentation**\n  * API and CRD docs updated to reflect Azure support for scale-from-zero.\n\n* **Tests**\n  * Added/updated tests covering Azure scale-from-zero, instance-type parsing, and annotation behavior.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+  "jiraTickets": [
+    "CNTRLPLANE-2262"
+  ],
+  "labels": [
+    "approved",
+    "tide/merge-method-squash",
+    "lgtm",
+    "jira/valid-reference",
+    "area/hypershift-operator",
+    "area/documentation",
+    "area/cli",
+    "area/testing",
+    "area/api",
+    "verified",
+    "area/platform/azure"
+  ],
+  "mergedAt": "2026-07-01T08:52:53Z",
+  "jiraHierarchy": {
+    "CNTRLPLANE-2262": {
+      "summary": "Enable scale from zero when CAPZ does not have native support",
+      "description": "Epic Goal\nExtend the support to ARO/HCP releases not covered by CNTRLPLANE-2261 work to enable NodePool CRs to support setting minimum replicas to 0, allowing node pools to scale down completely when using autoscaling (scale-from-zero functionality).\nAcceptance Criteria\nScale from/to zero works in OCP 4.20+ without changes to the release payload\ne2e coverage for the supported releases\nPrevious work\nCNTRLPLANE-1622",
+      "labels": [],
+      "priority": "Critical",
+      "status": "In Progress",
+      "epic": null,
+      "epicSummary": null,
+      "epicDescription": null,
+      "ocpstrat": "OCPSTRAT-3189",
+      "ocpstratSummary": "Enable autoscaler scale-from-zero on Azure via instance type capacity annotations",
+      "sfdcCasesTotal": 0,
+      "sfdcCasesOpen": 0,
+      "sfdcCaseIds": [],
+      "sfdcCasesLinks": ""
+    }
+  }
+}
