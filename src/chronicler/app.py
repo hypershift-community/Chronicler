@@ -2901,7 +2901,7 @@ def _valid_date(value: str) -> str:
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
-        description='Generate weekly PR report for HyperShift repositories',
+        description='Generate progress report blog posts from GitHub PRs and Jira tickets',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -2911,26 +2911,22 @@ Examples:
   %(prog)s 2026-02-05 --end 2026-02-12
       Report for specific date range
 
+  %(prog)s 2026-02-05 --config ~/my-project.toml
+      Use a custom config file
+
   %(prog)s 2026-02-05 --end 2026-02-12 --score
       Output scored PR list for deep analysis selection
 
   %(prog)s 2026-02-05 --score --score-limit 30
       Output top 30 scored PRs
 
-  %(prog)s 2026-02-05 --deep openshift/hypershift#7709 openshift/release#74707
+  %(prog)s 2026-02-05 --deep org/repo#123 org/other#456
       Fetch diffs for specific PRs (for deep analysis)
 
   %(prog)s 2026-02-05 --end 2026-02-12 --resume --output-dir DIR
       Resume a previous run, re-fetching only repos that failed
 
-PR format: owner/repo#number (e.g., openshift/hypershift#7657)
-
-Scoring criteria (higher = more important):
-  - Jira priority: Critical/Blocker=100, Major=50, Normal=20, Minor=10
-  - SDK/API/migration work: +30 points
-  - Feature work: +15 points
-  - Bug fixes (OCPBUGS): +10 points
-  - Manual CI changes (non-bot in release repo): +10 points
+PR format: owner/repo#number (e.g., org/repo#123)
         """
     )
     parser.add_argument(
@@ -2939,6 +2935,11 @@ Scoring criteria (higher = more important):
         type=_valid_date,
         default=(datetime.now() - timedelta(days=DEFAULT_DAYS_AGO)).strftime('%Y-%m-%d'),
         help='Start date in YYYY-MM-DD format (default: 7 days ago)'
+    )
+    parser.add_argument(
+        '--config',
+        metavar='PATH',
+        help='Path to TOML config file (default: auto-detected per platform)'
     )
     parser.add_argument(
         '--end',
@@ -3000,9 +3001,15 @@ Scoring criteria (higher = more important):
 
 
 async def main():
+    from pathlib import Path
+    from chronicler.config import load_config
+
     start_time = time.time()
 
     args = parse_args()
+    config_path = Path(args.config) if args.config else None
+    config = load_config(config_path)
+
     since_date = args.since_date
     end_date = args.end_date
     output_dir = args.output_dir
