@@ -4,7 +4,7 @@
 import json
 import pytest
 from unittest.mock import patch, MagicMock
-from weekly_pr_report import BLOG_PROMPT_TEMPLATE, fetch_model_pricing
+from chronicler.app import BLOG_PROMPT_TEMPLATE, fetch_model_pricing
 
 
 def test_blog_prompt_template_renders_without_errors():
@@ -93,8 +93,8 @@ def test_fetch_model_pricing_returns_dict():
         mock_urlopen.return_value = mock_response
 
         # Clear the cache first
-        import weekly_pr_report
-        weekly_pr_report._pricing_cache = None
+        import chronicler.app
+        chronicler.app._pricing_cache = None
 
         result = fetch_model_pricing("claude-sonnet-5", is_vertex=False)
 
@@ -131,8 +131,8 @@ def test_fetch_model_pricing_vertex_prefix():
         mock_urlopen.return_value = mock_response
 
         # Clear the cache
-        import weekly_pr_report
-        weekly_pr_report._pricing_cache = None
+        import chronicler.app
+        chronicler.app._pricing_cache = None
 
         result = fetch_model_pricing("claude-sonnet-5", is_vertex=True)
 
@@ -148,8 +148,8 @@ def test_fetch_model_pricing_network_failure():
         mock_urlopen.side_effect = Exception("Network error")
 
         # Clear the cache
-        import weekly_pr_report
-        weekly_pr_report._pricing_cache = None
+        import chronicler.app
+        chronicler.app._pricing_cache = None
 
         result = fetch_model_pricing("claude-sonnet-5", is_vertex=False)
 

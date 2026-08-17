@@ -1,7 +1,7 @@
 [project]
-name = "repo-metrics"
+name = "chronicler"
 version = "0.1.0"
-description = "Repository metrics and analysis tools"
+description = "Turn progress updates into polished blog posts"
 requires-python = ">=3.9"
 dependencies = [
     "PyYAML>=6.0",
@@ -10,21 +10,21 @@ dependencies = [
     "anthropic[vertex]>=0.52",
 ]
 
-[project.optional-dependencies]
-dev = [
-    "pytest>=7.0.0",
-]
-
 [project.scripts]
-pr-report = "weekly_pr_report:cli"
+chronicler = "chronicler.app:cli"
+
+[dependency-groups]
+dev = [
+    "pytest>=7.0",
+]
 
 [build-system]
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
-[tool.setuptools]
-py-modules = ["ai_assisted_commits", "weekly_pr_report"]
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [tool.pytest.ini_options]
-testpaths = ["."]
+testpaths = ["tests"]
 python_files = ["test_*.py"]
