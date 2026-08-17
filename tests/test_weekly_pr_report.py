@@ -33,7 +33,7 @@ def test_blog_prompt_template_renders_without_errors():
     assert 'Beneath the Headlines' in result, "Missing 'Beneath the Headlines' reference"
     assert 'NEVER guess' in result, "Missing 'NEVER guess' instruction"
     assert 'S360 references' in result, "Missing 'S360 references' in sensitive content section"
-    assert 'material-star-shooting' in result, "Missing 'material-star-shooting' icon reference"
+    assert 'material-newspaper-variant-outline' in result, "Missing material icon reference"
     assert 'contributor_table' in result, "Missing 'contributor_table' reference"
 
     # Assert placeholders were actually replaced (check a few)
@@ -63,7 +63,7 @@ def test_blog_prompt_template_contains_required_instructions():
     assert 'Credit contributors by GitHub handle' in BLOG_PROMPT_TEMPLATE
 
     # Check for structure elements
-    assert 'material-icon' in BLOG_PROMPT_TEMPLATE
+    assert 'material-newspaper-variant-outline' in BLOG_PROMPT_TEMPLATE
     assert 'stats_cards' in BLOG_PROMPT_TEMPLATE
     assert 'metrics_table' in BLOG_PROMPT_TEMPLATE
     assert 'top_reviewers_table' in BLOG_PROMPT_TEMPLATE
