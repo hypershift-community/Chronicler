@@ -8,6 +8,8 @@ dependencies = [
     "aiohttp>=3.9",
     "textual>=3.0",
     "anthropic[vertex]>=0.52",
+    "platformdirs>=4.0",
+    "tomli>=1.0; python_version < '3.11'",
 ]
 
 [project.scripts]
