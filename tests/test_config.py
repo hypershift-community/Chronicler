@@ -15,8 +15,7 @@ from chronicler.config import (
     LlmConfig,
     NoTeamConfig,
     OwnersConfig,
-    ReposConfig,
-    RepoSecondary,
+    RepoConfig,
     RosterConfig,
     load_config,
     render_sample_config,
@@ -31,13 +30,10 @@ class TestDefaults:
         cfg = ChroniclerConfig()
         assert cfg.project_name == "HyperShift"
 
-    def test_default_primary_repo(self):
+    def test_default_repos(self):
         cfg = ChroniclerConfig()
-        assert cfg.repos.primary == "openshift/hypershift"
-
-    def test_default_secondary_repos(self):
-        cfg = ChroniclerConfig()
-        names = [r.name for r in cfg.repos.secondary]
+        names = [r.name for r in cfg.repos]
+        assert "openshift/hypershift" in names
         assert "openshift-eng/ai-helpers" in names
         assert "openshift/enhancements" in names
         assert "openshift/release" in names
@@ -74,10 +70,10 @@ class TestDerivedProperties:
         assert cfg.ticket_regex.search("see CNTRLPLANE-42")
         assert not cfg.ticket_regex.search("UNKNOWN-999")
 
-    def test_primary_owner_and_name(self):
+    def test_repo_map(self):
         cfg = ChroniclerConfig()
-        assert cfg.primary_owner == "openshift"
-        assert cfg.primary_name == "hypershift"
+        assert "openshift/hypershift" in cfg.repo_map
+        assert cfg.repo_map["openshift/hypershift"].filter == "all"
 
     def test_repo_map(self):
         cfg = ChroniclerConfig()
@@ -118,22 +114,23 @@ class TestLoadConfig:
         assert cfg.project_name == "Karpenter"
         assert cfg.llm.model == "claude-opus-5"
         assert cfg.llm.vertex_region == "us-east5"  # kept default
-        assert cfg.repos.primary == "openshift/hypershift"  # kept default
+        assert cfg.repos[0].name == "openshift/hypershift"  # kept default
 
     def test_custom_repos(self, tmp_path):
         cfg_file = tmp_path / "config.toml"
         cfg_file.write_text(textwrap.dedent("""\
-            [repos]
-            primary = "my-org/my-repo"
+            [[repos]]
+            name = "my-org/my-repo"
 
-            [[repos.secondary]]
+            [[repos]]
             name = "my-org/docs"
-            filter = "team-only"
+            filter = "team"
         """))
         cfg = load_config(cfg_file)
-        assert cfg.repos.primary == "my-org/my-repo"
-        assert len(cfg.repos.secondary) == 1
-        assert cfg.repos.secondary[0].name == "my-org/docs"
+        assert cfg.repos[0].name == "my-org/my-repo"
+        assert len(cfg.repos) == 2
+        assert cfg.repos[1].name == "my-org/docs"
+        assert cfg.repos[1].filter == "team"
 
     def test_custom_jira_prefixes(self, tmp_path):
         cfg_file = tmp_path / "config.toml"

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Weekly PR Report Generator for HyperShift
-Optimized version with parallel API calls and batch processing
+Progress Report Generator for Chronicler
+Generates blog posts from GitHub PRs and Jira tickets.
 """
 
 import argparse
@@ -22,6 +22,8 @@ from textual.app import App, ComposeResult
 from textual.screen import Screen
 from textual.widgets import DataTable, Footer, Header, ProgressBar, RichLog, Static
 from textual.binding import Binding
+
+from chronicler.config import ChroniclerConfig, OwnersConfig, RosterConfig, NoTeamConfig
 
 # LiteLLM pricing database URL
 LITELLM_PRICING_URL = "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
@@ -115,18 +117,14 @@ JIRA_BATCH_SIZE = 100  # Max tickets per bulkfetch call
 class JiraClient:
     """Client for fetching Jira issues via REST API with batch support and rate limiting.
 
-    Targets Jira Cloud at redhat.atlassian.net. Uses Basic auth (email + API token).
-    Field mapping (Cloud IDs):
-      parent           = native hierarchy (Story->Epic->Feature, replaces old custom fields)
-      customfield_10978 = SFDC Cases Counter
-      customfield_10979 = SFDC Cases Links
-      customfield_10980 = SFDC Cases Open
+    Uses Basic auth (email + API token). Field list and SFDC custom field IDs
+    are driven by ChroniclerConfig.
     """
 
-    FIELDS = 'summary,description,parent,issuetype,customfield_10978,customfield_10979,customfield_10980,issuelinks,labels,priority,status'
-
-    def __init__(self):
-        self.base_url = os.getenv('JIRA_URL', 'https://redhat.atlassian.net')
+    def __init__(self, config: ChroniclerConfig = None):
+        self.config = config or ChroniclerConfig()
+        self.base_url = os.getenv('JIRA_URL', self.config.jira.url)
+        self.fields = self.config.jira_fields_csv
         self.token = os.getenv('JIRA_API_TOKEN') or os.getenv('JIRA_TOKEN')
         self.email = os.getenv('JIRA_USERNAME') or os.getenv('JIRA_EMAIL')
         self.enabled = bool(self.token and self.email)
@@ -224,7 +222,7 @@ class JiraClient:
         url = f'{self.base_url}/rest/api/3/issue/bulkfetch'
         payload = {
             'issueIdsOrKeys': ticket_keys,
-            'fields': self.FIELDS.split(','),
+            'fields': self.fields.split(','),
             'expand': ['renderedFields'],
         }
 
@@ -284,9 +282,10 @@ class JiraClient:
         # Extract SFDC case data from renderedFields (Cloud Forge app fields are
         # encrypted in raw fields but decrypted in renderedFields)
         rendered = issue.get('renderedFields', {})
-        sfdc_counter_str = rendered.get('customfield_10978') or '0'
-        sfdc_open_str = rendered.get('customfield_10980') or '0'
-        sfdc_links_str = rendered.get('customfield_10979') or ''
+        cf = self.config.jira.custom_fields
+        sfdc_counter_str = rendered.get(cf.sfdc_cases_total) or '0'
+        sfdc_open_str = rendered.get(cf.sfdc_cases_open) or '0'
+        sfdc_links_str = rendered.get(cf.sfdc_cases_links) or ''
 
         try:
             sfdc_cases_total = int(sfdc_counter_str)
@@ -352,7 +351,7 @@ class JiraClient:
         return all_results
 
     async def build_hierarchy(self, tickets: Set[str], progress_callback=None) -> Dict[str, Dict]:
-        """Build complete hierarchy including epics and OCPSTRAT parents."""
+        """Build complete hierarchy including epics and feature parents."""
         if not tickets:
             return {}
 
@@ -453,8 +452,8 @@ class JiraClient:
                 'epic': epic_key,
                 'epicSummary': epic_summary,
                 'epicDescription': epic_description,
-                'ocpstrat': feature_key,
-                'ocpstratSummary': feature_summary,
+                'feature': feature_key,
+                'featureSummary': feature_summary,
                 'sfdcCasesTotal': data.get('sfdcCasesTotal', 0),
                 'sfdcCasesOpen': data.get('sfdcCasesOpen', 0),
                 'sfdcCaseIds': data.get('sfdcCaseIds', []),
@@ -465,26 +464,25 @@ class JiraClient:
 
 
 class PRReportGenerator:
-    def __init__(self, since_date: str, end_date: Optional[str] = None, output_dir: str = '/tmp'):
+    def __init__(self, since_date: str, end_date: Optional[str] = None,
+                 output_dir: str = '/tmp', config: ChroniclerConfig = None):
+        self.config = config or ChroniclerConfig()
         self.since_date = since_date
         self.end_date = end_date or datetime.now().strftime('%Y-%m-%d')
         self.output_dir = output_dir
         self.github_token = os.getenv('GITHUB_TOKEN') or self._get_gh_token()
-        self.jira_url = os.getenv('JIRA_URL', 'https://redhat.atlassian.net')
+        self.jira_url = os.getenv('JIRA_URL', self.config.jira.url)
 
         # Data storage
         self.prs: List[Dict] = []
         self.jira_hierarchy: Dict = {}
-        self.hypershift_authors: Set[str] = set()
+        self.team_members: Set[str] = set()
         self.repo_fetch_status: Dict[str, str] = {}  # repo -> "ok" | "failed"
 
-    BOT_PATTERNS = ['-bot', '-robot', '[bot]']
-    BOT_LOGINS = {'coderabbitai', 'hypershift-jira-solve-ci', 'dependabot'}
-
-    @classmethod
-    def is_bot(cls, login: str) -> bool:
+    def is_bot(self, login: str) -> bool:
         login_lower = login.lower()
-        return login_lower in cls.BOT_LOGINS or any(p in login_lower for p in cls.BOT_PATTERNS)
+        bot_logins = {b.lower() for b in self.config.bots.logins}
+        return login_lower in bot_logins or any(p in login_lower for p in self.config.bots.patterns)
 
     async def _github_graphql_request(self, session, query: str, variables: Dict,
                                        headers: Dict, max_retries: int = 3) -> Optional[Dict]:
@@ -933,10 +931,7 @@ class PRReportGenerator:
 
         # Extract Jira tickets with word boundaries for accurate matching
         text = f"{pr['title']}\n{pr['body'] or ''}"
-        jira_tickets = list(set(re.findall(
-            r'\b(?:OCPBUGS|CNTRLPLANE|OCPSTRAT|RFE|HOSTEDCP)-\d+\b',
-            text
-        )))
+        jira_tickets = list(set(self.config.ticket_regex.findall(text)))
 
         # Extract labels
         labels = [label['name'] for label in pr.get('labels', {}).get('nodes', [])]
@@ -977,7 +972,7 @@ class PRReportGenerator:
 
     def _load_existing_prs(self) -> List[Dict]:
         """Load existing PR data from previous run."""
-        data_path = os.path.join(self.output_dir, 'hypershift_pr_details_fast.json')
+        data_path = os.path.join(self.output_dir, 'pr_details.json')
         try:
             with open(data_path, 'r') as f:
                 return json.load(f)
@@ -1010,23 +1005,19 @@ class PRReportGenerator:
             else:
                 print("No previous fetch status found, running full fetch")
 
-        print("Fetching HyperShift contributors...")
+        print(f"Resolving {self.config.project_name} team members...")
         if progress_callback:
-            await progress_callback(0, 4, "Fetching HyperShift contributors...")
+            await progress_callback(0, 4, f"Resolving {self.config.project_name} team members...")
 
-        # Get HyperShift contributors first
-        self.hypershift_authors = await self.fetch_repository_contributors('openshift', 'hypershift')
-        print(f"Found {len(self.hypershift_authors)} HyperShift contributors")
+        self.team_members = self._get_team_members()
+        print(f"Found {len(self.team_members)} {self.config.project_name} team members")
 
         print("Fetching PRs from repositories...")
         if progress_callback:
-            await progress_callback(1, 4, f"Found {len(self.hypershift_authors)} contributors, fetching PRs...")
+            await progress_callback(1, 4, f"Found {len(self.team_members)} team members, fetching PRs...")
 
-        # Build list of standard repos to fetch (excluding skipped ones)
         standard_repos = [
-            ('openshift', 'hypershift'),
-            ('openshift-eng', 'ai-helpers'),
-            ('openshift', 'enhancements'),
+            tuple(r.name.split('/')) for r in self.config.repos if not r.path_filter
         ]
         repos_to_fetch = [
             (owner, name) for owner, name in standard_repos
@@ -1056,42 +1047,40 @@ class PRReportGenerator:
                 self.repo_fetch_status[full] = 'ok'
                 repo_prs[full] = result
 
-        hypershift_prs = repo_prs.get('openshift/hypershift', [])
-
-        # Filter ai-helpers PRs to only HyperShift contributors
-        filtered_ai_helpers = [
-            pr for pr in repo_prs.get('openshift-eng/ai-helpers', [])
-            if pr['author'] in self.hypershift_authors
-        ]
-
-        # Filter enhancements PRs to only HyperShift contributors
-        filtered_enhancements = [
-            pr for pr in repo_prs.get('openshift/enhancements', [])
-            if pr['author'] in self.hypershift_authors
-        ]
+        standard_prs: List[Dict] = []
+        for repo_cfg in self.config.repos:
+            if repo_cfg.path_filter:
+                continue
+            prs_for_repo = repo_prs.get(repo_cfg.name, [])
+            if repo_cfg.filter == 'team':
+                prs_for_repo = [pr for pr in prs_for_repo if pr['author'] in self.team_members]
+            standard_prs.extend(prs_for_repo)
 
         if progress_callback:
-            await progress_callback(2, 4, "Fetched standard repos, fetching release PRs...")
+            await progress_callback(2, 4, "Fetched standard repos, fetching path-filtered repos...")
 
-        # Fetch openshift/release PRs filtered by HyperShift-related paths
-        release_prs = []
-        if 'openshift/release' not in skip_repos:
-            print("Fetching openshift/release PRs (filtering by HyperShift paths)...")
-            try:
-                release_prs = await self.fetch_release_prs_graphql()
-                self.repo_fetch_status['openshift/release'] = 'ok'
-            except RepoFetchError as e:
-                print(f"  {e}")
-                self.repo_fetch_status['openshift/release'] = 'failed'
+        path_filtered_prs: List[Dict] = []
+        for repo_cfg in self.config.repos:
+            if not repo_cfg.path_filter:
+                continue
+            if repo_cfg.name not in skip_repos:
+                print(f"Fetching {repo_cfg.name} PRs (filtering by {repo_cfg.path_filter} paths)...")
+                try:
+                    prs = await self.fetch_release_prs_graphql()
+                    self.repo_fetch_status[repo_cfg.name] = 'ok'
+                    path_filtered_prs.extend(prs)
+                except RepoFetchError as e:
+                    print(f"  {e}")
+                    self.repo_fetch_status[repo_cfg.name] = 'failed'
 
-        new_prs = hypershift_prs + filtered_ai_helpers + filtered_enhancements + release_prs
+        new_prs = standard_prs + path_filtered_prs
         self.prs = existing_prs + new_prs
 
         # Save fetch status for --resume
         self._save_fetch_status()
 
         failed = [r for r, s in self.repo_fetch_status.items() if s == 'failed']
-        msg = f"Found {len(new_prs)} new PRs ({len(hypershift_prs)} hypershift, {len(filtered_ai_helpers)} ai-helpers, {len(filtered_enhancements)} enhancements, {len(release_prs)} release)"
+        msg = f"Found {len(new_prs)} new PRs ({len(standard_prs)} standard, {len(path_filtered_prs)} path-filtered)"
         print(msg)
         if progress_callback:
             await progress_callback(4, 4, msg)
@@ -1118,7 +1107,7 @@ class PRReportGenerator:
             return
 
         # Check if we should use direct Jira API
-        jira_client = JiraClient()
+        jira_client = JiraClient(config=self.config)
 
         if jira_client.enabled:
             # Fetch directly via Jira REST API
@@ -1157,31 +1146,30 @@ class PRReportGenerator:
 
         with open(output_path, 'w') as f:
             # Header
-            f.write(f"# Weekly PR Report: openshift/hypershift\n")
+            f.write(f"# Weekly PR Report: {self.config.project_name}\n")
             f.write(f"**Period:** {self.since_date} to {self.end_date}\n")
 
             # Count by repo
-            hypershift_count = len([pr for pr in self.prs if pr['repo'] == 'openshift/hypershift'])
-            ai_helpers_count = len([pr for pr in self.prs if pr['repo'] == 'openshift-eng/ai-helpers'])
-            enhancements_count = len([pr for pr in self.prs if pr['repo'] == 'openshift/enhancements'])
-            release_count = len([pr for pr in self.prs if pr['repo'] == 'openshift/release'])
+            repo_counts = {}
+            all_repos = [r.name for r in self.config.repos]
+            for repo in all_repos:
+                repo_counts[repo] = len([pr for pr in self.prs if pr['repo'] == repo])
 
-            f.write(f"**Total PRs:** {len(self.prs)} ({hypershift_count} hypershift, {ai_helpers_count} ai-helpers, {enhancements_count} enhancements, {release_count} release)\n\n")
+            counts_str = ", ".join(f"{c} {r.split('/')[1]}" for r, c in repo_counts.items())
+            f.write(f"**Total PRs:** {len(self.prs)} ({counts_str})\n\n")
             f.write("---\n\n")
 
             # Summary Statistics
             f.write("## Summary Statistics\n\n")
             f.write("### Repository Breakdown\n")
-            f.write(f"- **openshift/hypershift:** {hypershift_count} PRs\n")
-            f.write(f"- **openshift-eng/ai-helpers:** {ai_helpers_count} PRs\n")
-            f.write(f"- **openshift/enhancements:** {enhancements_count} PRs\n")
-            f.write(f"- **openshift/release:** {release_count} PRs\n\n")
+            for repo, count in repo_counts.items():
+                f.write(f"- **{repo}:** {count} PRs\n")
+            f.write("\n")
 
-            # Group by OCPSTRAT
+            grouping_prefix = self.config.jira.grouping_prefix
             f.write("### Epic/Feature Groupings\n\n")
 
-            # Build OCPSTRAT groups
-            ocpstrat_groups = {}
+            feature_groups = {}
             ungrouped_prs = []
 
             for pr in self.prs:
@@ -1189,31 +1177,30 @@ class PRReportGenerator:
                 for ticket in pr['jiraTickets']:
                     if ticket in self.jira_hierarchy:
                         info = self.jira_hierarchy[ticket]
-                        if info.get('ocpstrat'):
-                            ocpstrat_key = info['ocpstrat']
-                            if ocpstrat_key not in ocpstrat_groups:
-                                ocpstrat_groups[ocpstrat_key] = {
-                                    'summary': info.get('ocpstratSummary', 'N/A'),
+                        if info.get('feature'):
+                            fkey = info['feature']
+                            if fkey not in feature_groups:
+                                feature_groups[fkey] = {
+                                    'summary': info.get('featureSummary', 'N/A'),
                                     'prs': []
                                 }
-                            ocpstrat_groups[ocpstrat_key]['prs'].append(pr)
+                            feature_groups[fkey]['prs'].append(pr)
                             grouped = True
                             break
 
                 if not grouped:
                     ungrouped_prs.append(pr)
 
-            # Write OCPSTRAT groups (PRs sorted by title within each group)
-            for ocpstrat_key in sorted(ocpstrat_groups.keys()):
-                group = ocpstrat_groups[ocpstrat_key]
-                f.write(f"#### [{ocpstrat_key}]({self.jira_url}/browse/{ocpstrat_key}): {group['summary']}\n")
+            for fkey in sorted(feature_groups.keys()):
+                group = feature_groups[fkey]
+                f.write(f"#### [{fkey}]({self.jira_url}/browse/{fkey}): {group['summary']}\n")
                 for pr in sorted(group['prs'], key=lambda p: p['title'].lower()):
                     f.write(f"- PR [#{pr['number']}]({pr['url']}) - {self._linkify_jira_tickets(pr['title'])}\n")
                 f.write("\n")
 
             # Write ungrouped PRs (sorted by title)
             if ungrouped_prs:
-                f.write("#### PRs without OCPSTRAT linkage\n")
+                f.write(f"#### PRs without {grouping_prefix} linkage\n")
                 for pr in sorted(ungrouped_prs, key=lambda p: p['title'].lower()):
                     f.write(f"- PR [#{pr['number']}]({pr['url']}) ({pr['repo'].split('/')[1]}) - {self._linkify_jira_tickets(pr['title'])}\n")
                 f.write("\n")
@@ -1260,26 +1247,23 @@ class PRReportGenerator:
                 f.write(f"- {day}: {count} PRs\n")
             f.write("\n")
 
-            # Categorize PRs into sections
-            bug_prs = []       # OCPBUGS tickets (any repo)
-            ai_helpers_prs = []  # openshift-eng/ai-helpers
-            enhancement_prs = []  # openshift/enhancements
-            feature_prs = []   # Everything else (features, improvements, CI)
+            bug_prefix = self.config.jira.bug_prefix
+            bug_prs = []
+            secondary_buckets: Dict[str, List[Dict]] = {}
+            feature_prs = []
 
+            filtered_repos = {r.name for r in self.config.repos if r.filter == 'team' or r.path_filter}
             for pr in self.prs:
-                if pr['repo'] == 'openshift-eng/ai-helpers':
-                    ai_helpers_prs.append(pr)
-                elif pr['repo'] == 'openshift/enhancements':
-                    enhancement_prs.append(pr)
-                elif any(t.startswith('OCPBUGS') for t in pr.get('jiraTickets', [])):
+                if pr['repo'] in filtered_repos:
+                    secondary_buckets.setdefault(pr['repo'], []).append(pr)
+                elif any(t.startswith(bug_prefix) for t in pr.get('jiraTickets', [])):
                     bug_prs.append(pr)
                 else:
                     feature_prs.append(pr)
 
-            # Write each section
-            self._write_section(f, "Bug Fixes (OCPBUGS)", bug_prs, show_sfdc=True)
-            self._write_section(f, "Enhancements", enhancement_prs)
-            self._write_section(f, "AI Helpers", ai_helpers_prs)
+            self._write_section(f, f"Bug Fixes ({bug_prefix})", bug_prs, show_sfdc=True)
+            for repo_name, prs in sorted(secondary_buckets.items()):
+                self._write_section(f, repo_name.split('/')[1].replace('-', ' ').title(), prs)
             self._write_section(f, "Features & Improvements", feature_prs)
 
         print(f"Report written to {output_path}")
@@ -1363,8 +1347,8 @@ class PRReportGenerator:
                         f.write(f"- Ticket: [{ticket}]({self.jira_url}/browse/{ticket}) - \"{info.get('summary', 'N/A')}\"\n")
                         if info.get('epic'):
                             f.write(f"  - Epic: [{info['epic']}]({self.jira_url}/browse/{info['epic']}) - \"{info.get('epicSummary', 'N/A')}\"\n")
-                        if info.get('ocpstrat'):
-                            f.write(f"  - OCPSTRAT: [{info['ocpstrat']}]({self.jira_url}/browse/{info['ocpstrat']}) - \"{info.get('ocpstratSummary', 'N/A')}\"\n")
+                        if info.get('feature'):
+                            f.write(f"  - Feature: [{info['feature']}]({self.jira_url}/browse/{info['feature']}) - \"{info.get('featureSummary', 'N/A')}\"\n")
                         # Show SFDC info if available
                         sfdc_total = info.get('sfdcCasesTotal', 0)
                         if sfdc_total:
@@ -1396,9 +1380,8 @@ class PRReportGenerator:
                 f.write(f"- Ready: Created ready\n")
             f.write(f"- Merged: {pr['mergedAt']} (Ready→Merge: {pr['readyToMergeHours']:.1f} hours)\n\n")
 
-            # OCPSTRAT Impact
             impact = self._generate_impact_statement(pr)
-            f.write(f"**OCPSTRAT Impact:** {impact}\n\n")
+            f.write(f"**Feature Impact:** {impact}\n\n")
 
             # Labels
             if pr['labels']:
@@ -1407,26 +1390,20 @@ class PRReportGenerator:
             f.write("\n---\n\n")
 
     def _generate_impact_statement(self, pr: Dict) -> str:
-        """Generate an OCPSTRAT impact statement based on PR data and Jira info"""
+        """Generate a feature impact statement based on PR data and Jira info."""
         title = pr['title'].lower()
         labels = [label.lower() for label in pr['labels']]
 
-        # Try to use Jira ticket description for better context
         if pr['jiraTickets']:
             for ticket in pr['jiraTickets']:
                 if ticket in self.jira_hierarchy:
                     jira_info = self.jira_hierarchy[ticket]
-
-                    # Use Jira summary and description for richer impact statement
                     summary = jira_info.get('summary', '')
-                    description = jira_info.get('description', '')
 
-                    # If we have an OCPSTRAT parent, use its context
-                    if jira_info.get('ocpstrat'):
-                        ocpstrat_summary = jira_info.get('ocpstratSummary', '')
-                        if ocpstrat_summary:
-                            # Extract key goal from OCPSTRAT summary
-                            return f"Advances {ocpstrat_summary}: {summary}"
+                    if jira_info.get('feature'):
+                        feature_summary = jira_info.get('featureSummary', '')
+                        if feature_summary:
+                            return f"Advances {feature_summary}: {summary}"
 
                     # Otherwise use the ticket summary
                     if summary:
@@ -1476,11 +1453,7 @@ class PRReportGenerator:
             ticket = match.group(0)
             return f"[{ticket}]({self.jira_url}/browse/{ticket})"
 
-        return re.sub(
-            r'(?:OCPBUGS|CNTRLPLANE|OCPSTRAT|RFE|HOSTEDCP)-\d+',
-            replace_ticket,
-            text
-        )
+        return self.config.ticket_regex.sub(replace_ticket, text)
 
     def save_raw_data(self, output_path: str):
         """Save raw PR data to JSON"""
@@ -1493,29 +1466,28 @@ class PRReportGenerator:
 
         Outputs a compact format optimized for LLM consumption:
         - Stats and period info
-        - PRs grouped by OCPSTRAT initiative
+        - PRs grouped by feature
         - Ungrouped PRs listed separately
         - No redundant duplication of PR data
         """
         # Build compact PR records
         def compact_pr(pr: Dict) -> Dict:
             """Create a compact PR record with essential fields only."""
-            # Get first OCPSTRAT from Jira tickets
-            ocpstrat = None
+            feature = None
             jira_summary = None
             for ticket in pr.get('jiraTickets', []):
                 if ticket in self.jira_hierarchy:
                     h = self.jira_hierarchy[ticket]
                     jira_summary = h.get('summary', '')
-                    if h.get('ocpstrat'):
-                        ocpstrat = h['ocpstrat']
+                    if h.get('feature'):
+                        feature = h['feature']
                         break
 
             # Get SFDC info
             sfdc_total, sfdc_open, sfdc_ids = self._get_pr_sfdc_info(pr)
 
             result = {
-                'repo': pr['repo'].split('/')[-1],  # Just repo name, not owner
+                'repo': pr['repo'],
                 'number': pr['number'],
                 'title': pr['title'],
                 'author': pr['author'],
@@ -1523,7 +1495,7 @@ class PRReportGenerator:
                 'priority': self._get_pr_jira_priority(pr),
                 'jira': pr.get('jiraTickets', []),
                 'jiraSummary': jira_summary,
-                'ocpstrat': ocpstrat,
+                'feature': feature,
                 'mergeHours': round(pr.get('readyToMergeHours') or 0, 1),
             }
 
@@ -1537,24 +1509,21 @@ class PRReportGenerator:
 
         compact_prs = [compact_pr(pr) for pr in self.prs]
 
-        # Group by OCPSTRAT
-        ocpstrat_groups = {}
+        feature_groups = {}
         ungrouped = []
 
         for pr in compact_prs:
-            ocpstrat = pr.get('ocpstrat')
-            if ocpstrat:
-                if ocpstrat not in ocpstrat_groups:
-                    # Find OCPSTRAT summary from jira_hierarchy
-                    ocpstrat_summary = self.jira_hierarchy.get(ocpstrat, {}).get('summary', '')
-                    ocpstrat_groups[ocpstrat] = {
-                        'key': ocpstrat,
-                        'summary': ocpstrat_summary,
+            feat = pr.get('feature')
+            if feat:
+                if feat not in feature_groups:
+                    feat_summary = self.jira_hierarchy.get(feat, {}).get('summary', '')
+                    feature_groups[feat] = {
+                        'key': feat,
+                        'summary': feat_summary,
                         'prs': []
                     }
-                # Remove ocpstrat from PR since it's redundant in grouped context
-                pr_copy = {k: v for k, v in pr.items() if k != 'ocpstrat'}
-                ocpstrat_groups[ocpstrat]['prs'].append(pr_copy)
+                pr_copy = {k: v for k, v in pr.items() if k != 'feature'}
+                feature_groups[feat]['prs'].append(pr_copy)
             else:
                 ungrouped.append(pr)
 
@@ -1586,15 +1555,13 @@ class PRReportGenerator:
             'period': f"{self.since_date} to {self.end_date}",
             'stats': {
                 'total': len(compact_prs),
-                'hypershift': len([p for p in compact_prs if p['repo'] == 'hypershift']),
-                'ai_helpers': len([p for p in compact_prs if p['repo'] == 'ai-helpers']),
-                'enhancements': len([p for p in compact_prs if p['repo'] == 'enhancements']),
-                'release': len([p for p in compact_prs if p['repo'] == 'release']),
+                **{r.name: len([p for p in compact_prs if p['repo'] == r.name])
+                   for r in self.config.repos},
                 'authors': len(set(p['author'] for p in compact_prs)),
                 'avgMergeHours': avg_merge,
                 'topReviewer': f"@{top_reviewer[0]} ({top_reviewer[1]} PRs)",
             },
-            'initiatives': list(ocpstrat_groups.values()),
+            'features': list(feature_groups.values()),
             'other': ungrouped,
             'scored': scored_list,  # Pre-scored for deep analysis selection
         }
@@ -1604,8 +1571,8 @@ class PRReportGenerator:
         print(f"Summary data saved to {output_path}")
 
     @staticmethod
-    def _parse_owners_aliases(path: str = 'OWNERS_ALIASES') -> Dict[str, Set[str]]:
-        """Parse OWNERS_ALIASES YAML file into a dict of group -> set of logins."""
+    def _parse_owners_aliases(path: str) -> Dict[str, Set[str]]:
+        """Parse an OWNERS_ALIASES YAML file into a dict of group -> set of logins."""
         import yaml
         aliases: Dict[str, Set[str]] = {}
         if not os.path.exists(path):
@@ -1616,16 +1583,20 @@ class PRReportGenerator:
             aliases[group] = set(members or [])
         return aliases
 
-    @staticmethod
-    def _get_hs_team(aliases: Dict[str, Set[str]]) -> Set[str]:
-        """Compute the HyperShift team set from OWNERS_ALIASES groups.
-
-        Formula: (core-approvers ∪ core-reviewers ∪ konflux-approvers) - gcp-reviewers
-        """
-        return ((aliases.get('core-approvers', set())
-                 | aliases.get('core-reviewers', set())
-                 | aliases.get('konflux-approvers', set()))
-                - aliases.get('gcp-reviewers', set()))
+    def _get_team_members(self) -> Set[str]:
+        """Resolve team members from config (OwnersConfig, RosterConfig, or NoTeamConfig)."""
+        team = self.config.team
+        if isinstance(team, NoTeamConfig):
+            return set()
+        if isinstance(team, RosterConfig):
+            return set(team.members)
+        aliases = self._parse_owners_aliases(team.file)
+        included = set()
+        for group in team.include_groups:
+            included |= aliases.get(group, set())
+        for group in team.exclude_groups:
+            included -= aliases.get(group, set())
+        return included
 
     def generate_blog_data(self, output_dir: str):
         """Generate blog_data.json with contributor table, metrics, and pre-rendered markdown.
@@ -1637,22 +1608,14 @@ class PRReportGenerator:
         start = self.since_date
         end = self.end_date
 
-        # Determine HyperShift team from OWNERS_ALIASES
-        aliases = self._parse_owners_aliases()
-        hs_team = self._get_hs_team(aliases)
-        if hs_team:
-            print(f"  HyperShift team ({len(hs_team)} members from OWNERS_ALIASES): "
-                  f"{', '.join(sorted(hs_team))}")
+        team = self._get_team_members()
+        if team:
+            print(f"  Team ({len(team)} members): {', '.join(sorted(team))}")
         else:
-            print("  Warning: could not parse OWNERS_ALIASES, ai-helpers filtering disabled")
+            print("  Warning: could not resolve team members, team-only filtering disabled")
 
-        # --- Collect per-author, per-repo PR data ---
-        repo_map = {
-            'openshift/hypershift': 'hypershift',
-            'openshift/release': 'release',
-            'openshift-eng/ai-helpers': 'ai-helpers',
-            'openshift/enhancements': 'enhancements',
-        }
+        repo_map = {r.name: r.name.split('/')[1] for r in self.config.repos}
+        team_only_repos = {r.name for r in self.config.repos if r.filter == 'team'}
         # author -> repo -> list of PR dicts
         author_prs: Dict[str, Dict[str, List[Dict]]] = {}
         for pr in self.prs:
@@ -1666,34 +1629,44 @@ class PRReportGenerator:
                 author_prs[author][repo] = []
             author_prs[author][repo].append(pr)
 
-        # --- Contributor inclusion rules ---
-        hs_authors = {a for a, repos in author_prs.items() if 'openshift/hypershift' in repos}
-        release_authors = {a for a, repos in author_prs.items() if 'openshift/release' in repos}
-        enhancement_authors = {a for a, repos in author_prs.items() if 'openshift/enhancements' in repos}
-        ai_authors = {a for a, repos in author_prs.items() if 'openshift-eng/ai-helpers' in repos}
+        main_repos = {r.name for r in self.config.repos if r.filter == 'all' and not r.path_filter}
+        main_authors = set()
+        other_authors = set()
+        team_only_authors = set()
+        for a, repos in author_prs.items():
+            for repo in repos:
+                if repo in main_repos:
+                    main_authors.add(a)
+                elif repo in team_only_repos:
+                    team_only_authors.add(a)
+                else:
+                    other_authors.add(a)
 
-        # ai-helpers PRs only count if the author is on the HyperShift team (from OWNERS_ALIASES)
-        included = hs_authors | release_authors | enhancement_authors | (ai_authors & hs_team)
+        included = main_authors | other_authors | (team_only_authors & team)
 
-        # --- Bugfix detection ---
+        bug_prefix = self.config.jira.bug_prefix
+
         def is_bugfix(pr: Dict) -> bool:
-            return (any('OCPBUGS' in t for t in pr.get('jiraTickets', []))
-                    or 'OCPBUGS' in pr.get('title', ''))
+            return (any(bug_prefix in t for t in pr.get('jiraTickets', []))
+                    or bug_prefix in pr.get('title', ''))
 
         # --- Build GitHub URL for a count ---
+        path_filtered_repos = {r.name: r.path_filter for r in self.config.repos if r.path_filter}
+
         def make_url(repo: str, author: str, prs_list: List[Dict]) -> str:
             if len(prs_list) == 1:
                 return prs_list[0]['url']
             q = f"is%3Apr+is%3Amerged+author%3A{author}+merged%3A{start}..{end}"
-            if repo == 'openshift/release':
-                q += '+hypershift'
+            if repo in path_filtered_repos:
+                q += f'+{path_filtered_repos[repo]}'
             return f"https://github.com/{repo}/pulls?q={q}"
 
-        def make_bug_url(author: str, bug_prs: List[Dict]) -> str:
-            if len(bug_prs) == 1:
-                return bug_prs[0]['url']
-            return (f"https://github.com/search?q=org%3Aopenshift+is%3Apr+is%3Amerged+"
-                    f"author%3A{author}+merged%3A{start}..{end}+OCPBUGS&type=pullrequests")
+        def make_bug_url(author: str, bug_prs_list: List[Dict]) -> str:
+            if len(bug_prs_list) == 1:
+                return bug_prs_list[0]['url']
+            org = self.config.repos[0].name.split('/')[0]
+            return (f"https://github.com/search?q=org%3A{org}+is%3Apr+is%3Amerged+"
+                    f"author%3A{author}+merged%3A{start}..{end}+{bug_prefix}&type=pullrequests")
 
         # --- Build contributor records ---
         contributors = []
@@ -1702,8 +1675,7 @@ class PRReportGenerator:
             total = 0
             for full_repo in repo_map:
                 prs_in_repo = author_prs.get(author, {}).get(full_repo, [])
-                # Only include ai-helpers if author is on hs_team
-                if full_repo == 'openshift-eng/ai-helpers' and author not in hs_team:
+                if full_repo in team_only_repos and author not in team:
                     continue
                 count = len(prs_in_repo)
                 if count > 0:
@@ -1716,7 +1688,7 @@ class PRReportGenerator:
             bug_prs_list = [
                 pr
                 for repo_name, repo_prs in author_prs.get(author, {}).items()
-                if not (repo_name == 'openshift-eng/ai-helpers' and author not in hs_team)
+                if not (repo_name in team_only_repos and author not in team)
                 for pr in repo_prs
                 if is_bugfix(pr)
             ]
@@ -1728,12 +1700,8 @@ class PRReportGenerator:
                 'bugs': {'count': bug_count, 'url': make_bug_url(author, bug_prs_list)} if bug_count else {'count': 0},
                 'total': total,
             }
-            # Flag release-only contributors for LLM spot-checking
-            if author in release_authors and author not in (hs_authors | enhancement_authors):
-                entry['release_only'] = True
-                # Include their release PR numbers for easy verification
-                release_prs = author_prs.get(author, {}).get('openshift/release', [])
-                entry['release_pr_numbers'] = [f"openshift/release#{pr['number']}" for pr in release_prs]
+            if author not in main_authors:
+                entry['secondary_only'] = True
 
             contributors.append(entry)
 
@@ -1809,10 +1777,10 @@ class PRReportGenerator:
             ('Total PRs merged', stats['total_prs']),
             ('Unique contributors', stats['contributor_count']),
             ('Bot PRs', stats['bot_prs']),
-            ('HyperShift repo PRs', by_repo.get('openshift/hypershift', 0)),
-            ('Release repo PRs', by_repo.get('openshift/release', 0)),
-            ('AI-helpers repo PRs', by_repo.get('openshift-eng/ai-helpers', 0)),
-            ('Enhancement proposals', by_repo.get('openshift/enhancements', 0)),
+        ]
+        for full_repo, short in repo_map.items():
+            metrics_rows.append((f'{short} PRs', by_repo.get(full_repo, 0)))
+        metrics_rows += [
             ('Average merge time', f'{avg_merge} hours'),
             ('High-impact PRs', high_impact),
             ('Breaking changes', breaking_changes),
@@ -1827,14 +1795,16 @@ class PRReportGenerator:
         for login, count in top_reviewers:
             reviewers_table += f'| [@{login}](https://github.com/{login}) | {count} |\n'
 
-        contrib_header = ('| Contributor | hypershift | release | ai-helpers | enhancements '
-                          '| :material-bug: bugs | Total |\n'
-                          '|------------|:-:|:-:|:-:|:-:|:-:|:-:|\n')
+        repo_short_names = list(repo_map.values())
+        col_headers = ' | '.join(repo_short_names)
+        col_dividers = ' | '.join([':-:'] * len(repo_short_names))
+        contrib_header = (f'| Contributor | {col_headers} '
+                          f'| :material-bug: bugs | Total |\n'
+                          f'|------------|{col_dividers}|:-:|:-:|\n')
         contrib_rows = ''
         for c in contributors:
             row_cells = [f'| [@{c["login"]}](https://github.com/{c["login"]})']
-            for full_repo in ['openshift/hypershift', 'openshift/release',
-                              'openshift-eng/ai-helpers', 'openshift/enhancements']:
+            for full_repo in repo_map:
                 repo_data = c['repos'].get(full_repo)
                 if repo_data:
                     row_cells.append(f'[{repo_data["count"]}]({repo_data["url"]})')
@@ -1853,7 +1823,7 @@ class PRReportGenerator:
         output = {
             'period': {'start': start, 'end': end},
             'stats': stats,
-            'hs_team': sorted(hs_team),
+            'team': sorted(team),
             'top_reviewers': [{'login': login, 'count': count} for login, count in top_reviewers],
             'contributors': contributors,
             'markdown': {
@@ -1923,17 +1893,12 @@ class PRReportGenerator:
                 return f"{commit_type}:{scope}"
             return commit_type
 
-        # Fallback: check for OCPBUGS (bug fix)
-        if any(t.startswith('OCPBUGS') for t in pr.get('jiraTickets', [])):
+        if any(t.startswith(self.config.jira.bug_prefix) for t in pr.get('jiraTickets', [])):
             return 'fix'
 
-        # Fallback: CI for release repo
-        if pr['repo'] == 'openshift/release':
-            return 'ci'
-
-        # Enhancement proposals
-        if pr['repo'] == 'openshift/enhancements':
-            return 'enhancement'
+        repo_cfg = self.config.repo_map.get(pr['repo'])
+        if repo_cfg and repo_cfg.category:
+            return repo_cfg.category
 
         return '-'
 
@@ -1960,13 +1925,13 @@ class PRReportGenerator:
         """Score PRs by importance for deep analysis selection.
 
         Scoring criteria (higher = more important):
-        - Enhancement proposals (openshift/enhancements): +200 points (always selected)
+        - Enhancement category repos: +200 points (always selected)
         - Jira priority: Critical=100, Blocker=100, Major=50, Normal=20, Minor=10
         - SDK/API/migration work: +30 points
         - Feature work (feat in title): +15 points
-        - Bug fixes (OCPBUGS): +10 points
+        - Bug fixes (bug_prefix tickets): +10 points
         - Has Jira ticket: +5 points
-        - Non-bot author in openshift/release: +10 points
+        - Non-bot author in CI category repos: +10 points
 
         Args:
             limit: Maximum number of PRs to return
@@ -2011,22 +1976,19 @@ class PRReportGenerator:
                 score += 15
                 reasons.append('feature')
 
-            # Bug fixes get moderate priority
-            if any(t.startswith('OCPBUGS') for t in pr.get('jiraTickets', [])):
+            if any(t.startswith(self.config.jira.bug_prefix) for t in pr.get('jiraTickets', [])):
                 score += 10
                 reasons.append('bugfix')
 
-            # Having any Jira ticket is better than none
             if pr.get('jiraTickets'):
                 score += 5
 
-            # Enhancement proposals are always high-priority for deep analysis
-            if pr['repo'] == 'openshift/enhancements':
+            repo_cfg = self.config.repo_map.get(pr['repo'])
+            if repo_cfg and repo_cfg.category == 'enhancement':
                 score += 200
                 reasons.append('enhancement')
 
-            # For release repo, prefer non-bot PRs (manual CI changes)
-            if pr['repo'] == 'openshift/release':
+            if repo_cfg and repo_cfg.category == 'ci':
                 if not self.is_bot(pr.get('author', '')):
                     score += 10
                     reasons.append('manual-CI')
@@ -2253,7 +2215,7 @@ class PRReportGenerator:
 
         # Use Vertex AI if configured, otherwise direct Anthropic API
         vertex_project = os.environ.get('ANTHROPIC_VERTEX_PROJECT_ID') or os.environ.get('GOOGLE_CLOUD_PROJECT')
-        vertex_region = os.environ.get('CLOUD_ML_REGION', 'us-east5')
+        vertex_region = os.environ.get('CLOUD_ML_REGION', self.config.llm.vertex_region)
         if vertex_project:
             client = anthropic.AsyncAnthropicVertex(project_id=vertex_project, region=vertex_region)
             backend = f"Vertex AI ({vertex_region})"
@@ -2319,7 +2281,7 @@ Output ONLY the JSON object, no markdown fences, no explanation."""
             async with semaphore:
                 try:
                     response = await client.messages.create(
-                        model="claude-sonnet-5",
+                        model=self.config.llm.model,
                         max_tokens=1024,
                         system=ANALYSIS_SYSTEM_PROMPT,
                         messages=[{"role": "user", "content": user_prompt}],
@@ -2381,7 +2343,7 @@ Output ONLY the JSON object, no markdown fences, no explanation."""
 
         # Fetch pricing for the actual model used
         is_vertex = vertex_project is not None
-        pricing = fetch_model_pricing(actual_model or "claude-sonnet-5", is_vertex=is_vertex)
+        pricing = fetch_model_pricing(actual_model or self.config.llm.model, is_vertex=is_vertex)
 
         print(f"\n  Analysis complete:")
         print(f"    Successful: {len(successful)}/{len(results)}")
@@ -2389,7 +2351,7 @@ Output ONLY the JSON object, no markdown fences, no explanation."""
             print(f"    Failed:     {failed}")
 
         # Display model name
-        model_display = actual_model or "claude-sonnet-5"
+        model_display = actual_model or self.config.llm.model
         if is_vertex:
             model_display += " (Vertex AI)"
         print(f"    Model:      {model_display}")
@@ -2457,7 +2419,7 @@ Output ONLY the JSON object, no markdown fences, no explanation."""
         print(f"    High impact:      {aggregated['summary']['high_impact_count']}")
 
 
-BLOG_PROMPT_TEMPLATE = """You are writing a monthly progress report blog post for the HyperShift project.
+BLOG_PROMPT_TEMPLATE = """You are writing a monthly progress report blog post for the {project_name} project.
 
 ## Input Files
 
@@ -2762,8 +2724,8 @@ class PipelineApp(App):
             # Phase 3: Generate reports (sync, fast)
             self._set_phase("Generating reports")
             generator.generate_report(os.path.join(output_dir, 'weekly_pr_report_fast.md'))
-            generator.save_raw_data(os.path.join(output_dir, 'hypershift_pr_details_fast.json'))
-            generator.save_summary_data(os.path.join(output_dir, 'hypershift_pr_summary.json'))
+            generator.save_raw_data(os.path.join(output_dir, 'pr_details.json'))
+            generator.save_summary_data(os.path.join(output_dir, 'pr_summary.json'))
             if args.blog_data:
                 generator.generate_blog_data(output_dir)
             self._log("[green]✓[/green] Reports generated")
@@ -3015,7 +2977,7 @@ async def main():
     output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)
 
-    generator = PRReportGenerator(since_date, end_date, output_dir=output_dir)
+    generator = PRReportGenerator(since_date, end_date, output_dir=output_dir, config=config)
 
     if args.select:
         # TUI mode: full pipeline in a single Textual app window
@@ -3051,8 +3013,8 @@ async def main():
         await generator.load_jira_hierarchy()
 
         generator.generate_report(os.path.join(output_dir, 'weekly_pr_report_fast.md'))
-        generator.save_raw_data(os.path.join(output_dir, 'hypershift_pr_details_fast.json'))
-        generator.save_summary_data(os.path.join(output_dir, 'hypershift_pr_summary.json'))
+        generator.save_raw_data(os.path.join(output_dir, 'pr_details.json'))
+        generator.save_summary_data(os.path.join(output_dir, 'pr_summary.json'))
 
         if args.blog_data:
             generator.generate_blog_data(output_dir)
@@ -3150,6 +3112,7 @@ async def main():
         blog_filename = f"{end_dt.strftime('%Y-%m')}-progress-report.md"
 
         prompt = BLOG_PROMPT_TEMPLATE.format(
+            project_name=self.config.project_name,
             aggregated_path=aggregated_path,
             blog_data_path=blog_data_path,
             template_path=template_path,

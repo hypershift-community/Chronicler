@@ -11,6 +11,7 @@ def test_blog_prompt_template_renders_without_errors():
     """Verify BLOG_PROMPT_TEMPLATE renders successfully with all required placeholders."""
     # Dummy/placeholder values for all format parameters
     params = {
+        'project_name': 'TestProject',
         'aggregated_path': '/tmp/pr_deep_aggregated.json',
         'blog_data_path': '/tmp/blog_data.json',
         'template_path': 'docs/content/blog/2026-06-progress-report.md',

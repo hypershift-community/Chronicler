@@ -37,23 +37,12 @@ def _f(default, desc: str, **kwargs):
 # ---------------------------------------------------------------------------
 
 @dataclass
-class RepoSecondary:
-    name: str = _f("org/other-repo", "GitHub owner/name")
-    filter: Optional[str] = _f(None, '"team-only" to include only team members\' PRs')
+class RepoConfig:
+    name: str = _f("org/repo", "GitHub owner/name")
+    filter: str = _f("all", '"all" for every PR, "team" for team members only')
     path_filter: Optional[str] = _f(None, "Keyword for two-pass file-path filtering")
-
-
-@dataclass
-class ReposConfig:
-    primary: str = _f("openshift/hypershift", "Primary GitHub repository (owner/name)")
-    secondary: List[RepoSecondary] = field(
-        default_factory=lambda: [
-            RepoSecondary(name="openshift-eng/ai-helpers", filter="team-only"),
-            RepoSecondary(name="openshift/enhancements", filter="team-only"),
-            RepoSecondary(name="openshift/release", path_filter="hypershift"),
-        ],
-        metadata={"desc": "Additional repositories to scan"},
-    )
+    category: Optional[str] = _f(None, "Category label for PR classification (e.g. enhancement, ci)")
+    description: str = _f("", "What this repo is about, used as LLM context")
 
 
 @dataclass
@@ -80,7 +69,7 @@ class JiraConfig:
 
 @dataclass
 class OwnersConfig:
-    file: str = _f("OWNERS_ALIASES", "Path to the owners/aliases file in the primary repo")
+    file: str = _f("OWNERS_ALIASES", "Filesystem path to the owners/aliases YAML file")
     include_groups: List[str] = _f(
         ["core-approvers", "core-reviewers", "konflux-approvers"],
         "Groups to include as team members",
@@ -133,10 +122,23 @@ class BlogConfig:
     format: str = _f("mkdocs-material", "Blog output format")
 
 
+def _default_repos() -> List[RepoConfig]:
+    return [
+        RepoConfig(name="openshift/hypershift", filter="all",
+                    description="The main HyperShift operator for hosted control planes"),
+        RepoConfig(name="openshift-eng/ai-helpers", filter="team",
+                    description="AI-assisted development tools for OpenShift engineering"),
+        RepoConfig(name="openshift/enhancements", filter="team", category="enhancement",
+                    description="Formal design proposals for new OpenShift features"),
+        RepoConfig(name="openshift/release", filter="all", path_filter="hypershift", category="ci",
+                    description="CI/CD job definitions and release infrastructure"),
+    ]
+
+
 @dataclass
 class ChroniclerConfig:
     project_name: str = _f("HyperShift", "Human-readable project name")
-    repos: ReposConfig = field(default_factory=ReposConfig, metadata={"desc": "Repository settings"})
+    repos: List[RepoConfig] = field(default_factory=_default_repos, metadata={"desc": "Repositories to scan"})
     jira: JiraConfig = field(default_factory=JiraConfig, metadata={"desc": "Jira settings"})
     team: TeamConfig = field(default_factory=OwnersConfig, metadata={"desc": "Team membership"})
     bots: BotsConfig = field(default_factory=BotsConfig, metadata={"desc": "Bot detection"})
@@ -149,16 +151,8 @@ class ChroniclerConfig:
         return re.compile(rf"\b(?:{prefixes})-\d+\b")
 
     @property
-    def primary_owner(self) -> str:
-        return self.repos.primary.split("/")[0]
-
-    @property
-    def primary_name(self) -> str:
-        return self.repos.primary.split("/")[1]
-
-    @property
-    def repo_map(self) -> Dict[str, RepoSecondary]:
-        return {r.name: r for r in self.repos.secondary}
+    def repo_map(self) -> Dict[str, RepoConfig]:
+        return {r.name: r for r in self.repos}
 
     @property
     def jira_fields_csv(self) -> str:
@@ -230,7 +224,7 @@ def render_sample_config() -> str:
     lines.append(f"# {fields(cfg)[0].metadata.get('desc', '')}")
     lines.append(f"# name = {_toml_value(cfg.project_name)}")
 
-    # Remaining top-level fields are all nested dataclasses
+    # Remaining top-level fields
     for f in fields(cfg):
         if f.name == "project_name":
             continue
@@ -240,7 +234,12 @@ def render_sample_config() -> str:
         if desc:
             lines.append(f"# {desc}")
 
-        if f.name == "team":
+        if f.name == "repos":
+            for item in val:
+                lines.append(f"# [[repos]]")
+                _render_fields(item, "", lines)
+                lines.append("")
+        elif f.name == "team":
             _render_team_sample(lines)
         else:
             lines.append(f"# [{f.name}]")
@@ -271,12 +270,14 @@ def _render_team_sample(lines: list) -> None:
 # Config loading
 # ---------------------------------------------------------------------------
 
-def _build_secondary(raw: list) -> List[RepoSecondary]:
+def _build_repos(raw: list) -> List[RepoConfig]:
     return [
-        RepoSecondary(
+        RepoConfig(
             name=entry["name"],
-            filter=entry.get("filter"),
+            filter=entry.get("filter", "all"),
             path_filter=entry.get("path_filter"),
+            category=entry.get("category"),
+            description=entry.get("description", ""),
         )
         for entry in raw
     ]
@@ -285,15 +286,8 @@ def _build_secondary(raw: list) -> List[RepoSecondary]:
 def _build_config(data: dict) -> ChroniclerConfig:
     project_name = data.get("project", {}).get("name", "HyperShift")
 
-    repos_raw = data.get("repos", {})
-    repos = ReposConfig(
-        primary=repos_raw.get("primary", ReposConfig.primary),
-        secondary=(
-            _build_secondary(repos_raw["secondary"])
-            if "secondary" in repos_raw
-            else ReposConfig().secondary
-        ),
-    )
+    repos_raw = data.get("repos")
+    repos = _build_repos(repos_raw) if repos_raw is not None else _default_repos()
 
     jira_raw = data.get("jira", {})
     cf_raw = jira_raw.get("custom_fields", {})
