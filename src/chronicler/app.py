@@ -2460,7 +2460,7 @@ Contributors: {contributor_count}
 
 Follow the structure, formatting, and MkDocs Material styling from the style reference template exactly. Pre-rendered markdown sections in blog_data.json (stats_cards, metrics_table, top_reviewers_table, contributor_table) should be inserted verbatim.
 
-The output file is docs/content/blog/{blog_filename}.
+The output file is {blog_output_dir}/{blog_filename}.
 
 ### Phase 0: Story selection (interactive)
 
@@ -2482,11 +2482,11 @@ After listing them, ask the user which deep stories to develop and which smaller
 
 ### Phase 1: Write the blog post
 
-Based on the user's story selection, write the full blog post following the Writing Style Guide above and the structure from the style reference template. Write directly to docs/content/blog/{blog_filename}.
+Based on the user's story selection, write the full blog post following the Writing Style Guide above and the structure from the style reference template. Write directly to {blog_output_dir}/{blog_filename}.
 
 ### Phase 2: Update site navigation
 
-1. Update docs/content/blog/index.md — add new card entry at the TOP of the grid (after the opening `<div class="grid cards" markdown>` line), using this template:
+1. Update {blog_output_dir}/index.md — add new card entry at the TOP of the grid (after the opening `<div class="grid cards" markdown>` line), using this template:
 
     -   :material-newspaper-variant-outline:{{{{ .lg .middle }}}} **[Month] [Year] Progress Report**
 
@@ -3096,10 +3096,11 @@ async def main():
             sys.exit(1)
 
         # Find the most recent blog post as style reference
+        blog_output_dir = config.blog.output_dir
         blog_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                                'docs', 'content', 'blog')
+                                blog_output_dir)
         existing_blogs = sorted(_glob.glob(os.path.join(blog_dir, '*-progress-report.md')))
-        template_path = existing_blogs[-1] if existing_blogs else 'docs/content/blog/2026-06-progress-report.md'
+        template_path = existing_blogs[-1] if existing_blogs else f'{blog_output_dir}/2026-06-progress-report.md'
 
         # Get stats from blog_data.json
         with open(blog_data_path) as f:
@@ -3112,7 +3113,7 @@ async def main():
         blog_filename = f"{end_dt.strftime('%Y-%m')}-progress-report.md"
 
         prompt = BLOG_PROMPT_TEMPLATE.format(
-            project_name=self.config.project_name,
+            project_name=config.project_name,
             aggregated_path=aggregated_path,
             blog_data_path=blog_data_path,
             template_path=template_path,
@@ -3121,6 +3122,7 @@ async def main():
             pr_count=pr_count,
             contributor_count=contributor_count,
             blog_filename=blog_filename,
+            blog_output_dir=blog_output_dir,
         )
 
         print(f"Launching Claude Code for blog writing...")
