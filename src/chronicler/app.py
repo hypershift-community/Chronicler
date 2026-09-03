@@ -3100,7 +3100,7 @@ async def main():
         blog_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                 blog_output_dir)
         existing_blogs = sorted(_glob.glob(os.path.join(blog_dir, '*-progress-report.md')))
-        template_path = existing_blogs[-1] if existing_blogs else f'{blog_output_dir}/2026-06-progress-report.md'
+        template_path = existing_blogs[-1] if existing_blogs else os.path.join(blog_output_dir, '2026-06-progress-report.md')
 
         # Get stats from blog_data.json
         with open(blog_data_path) as f:

@@ -7,9 +7,8 @@ from unittest.mock import patch, MagicMock
 from chronicler.app import BLOG_PROMPT_TEMPLATE, PRReportGenerator, fetch_model_pricing
 
 
-def test_blog_prompt_template_renders_without_errors():
-    """Verify BLOG_PROMPT_TEMPLATE renders successfully with all required placeholders."""
-    # Dummy/placeholder values for all format parameters
+def _make_template_params(**overrides):
+    """Build a default template params dict, applying any overrides."""
     params = {
         'project_name': 'TestProject',
         'aggregated_path': '/tmp/pr_deep_aggregated.json',
@@ -22,6 +21,13 @@ def test_blog_prompt_template_renders_without_errors():
         'blog_filename': '2026-07-progress-report.md',
         'blog_output_dir': 'docs/content/blog',
     }
+    params.update(overrides)
+    return params
+
+
+def test_blog_prompt_template_renders_without_errors():
+    """Verify BLOG_PROMPT_TEMPLATE renders successfully with all required placeholders."""
+    params = _make_template_params()
 
     # Render the template
     result = BLOG_PROMPT_TEMPLATE.format(**params)
@@ -79,18 +85,7 @@ def test_blog_prompt_template_contains_required_instructions():
 
 def test_blog_prompt_template_uses_custom_project_name():
     """Verify rendered template uses the custom project name, not 'HyperShift'."""
-    params = {
-        'project_name': 'Karpenter',
-        'aggregated_path': '/tmp/agg.json',
-        'blog_data_path': '/tmp/blog.json',
-        'template_path': 'docs/blog/template.md',
-        'start_date': '2026-08-01',
-        'end_date': '2026-08-31',
-        'pr_count': 10,
-        'contributor_count': 5,
-        'blog_filename': '2026-08-progress-report.md',
-        'blog_output_dir': 'site/blog',
-    }
+    params = _make_template_params(project_name='Karpenter', blog_output_dir='site/blog')
     result = BLOG_PROMPT_TEMPLATE.format(**params)
 
     # Project name should appear (from placeholder)
@@ -101,18 +96,11 @@ def test_blog_prompt_template_uses_custom_project_name():
 
 def test_blog_prompt_template_uses_custom_output_dir():
     """Verify rendered template uses blog_output_dir, not hardcoded 'docs/content/blog'."""
-    params = {
-        'project_name': 'MyProject',
-        'aggregated_path': '/tmp/agg.json',
-        'blog_data_path': '/tmp/blog.json',
-        'template_path': 'custom/blog/template.md',
-        'start_date': '2026-08-01',
-        'end_date': '2026-08-31',
-        'pr_count': 10,
-        'contributor_count': 5,
-        'blog_filename': '2026-08-progress-report.md',
-        'blog_output_dir': 'custom/blog/output',
-    }
+    params = _make_template_params(
+        blog_output_dir='custom/blog/output',
+        template_path='custom/blog/template.md',
+        blog_filename='2026-08-progress-report.md',
+    )
     result = BLOG_PROMPT_TEMPLATE.format(**params)
 
     # The custom output dir should appear in the output file path
@@ -127,12 +115,28 @@ def test_blog_prompt_template_no_hardcoded_blog_path():
     """Verify the raw template has no hardcoded 'docs/content/blog' paths."""
     # The raw template should only contain {blog_output_dir} placeholders,
     # not hardcoded docs/content/blog paths
-    assert 'docs/content/blog/' not in BLOG_PROMPT_TEMPLATE, \
-        "Template contains hardcoded 'docs/content/blog/' path — should use {blog_output_dir}"
+    assert 'docs/content/blog' not in BLOG_PROMPT_TEMPLATE, \
+        "Template contains hardcoded 'docs/content/blog' path — should use {blog_output_dir}"
+
+
+@pytest.fixture
+def make_generator(tmp_path):
+    """Create a PRReportGenerator with standard test dates and empty state."""
+    def _factory(config, prs=None):
+        generator = PRReportGenerator(
+            since_date="2026-08-01",
+            end_date="2026-08-31",
+            output_dir=str(tmp_path),
+            config=config,
+        )
+        generator.prs = prs or []
+        generator.jira_hierarchy = {}
+        return generator
+    return _factory
 
 
 @patch.dict('os.environ', {'GITHUB_TOKEN': 'fake-token'})
-def test_generate_blog_data_contributor_columns(tmp_path):
+def test_generate_blog_data_contributor_columns(tmp_path, make_generator):
     """Verify generate_blog_data dynamically generates contributor columns from config repos."""
     from chronicler.config import ChroniclerConfig, RepoConfig, BlogConfig, NoTeamConfig
 
@@ -146,14 +150,7 @@ def test_generate_blog_data_contributor_columns(tmp_path):
         blog=BlogConfig(output_dir="custom/blog"),
     )
 
-    generator = PRReportGenerator(
-        since_date="2026-08-01",
-        end_date="2026-08-31",
-        output_dir=str(tmp_path),
-        config=custom_config,
-    )
-    # Simulate one PR per repo
-    generator.prs = [
+    generator = make_generator(custom_config, prs=[
         {
             'repo': 'myorg/alpha',
             'number': 1,
@@ -172,8 +169,7 @@ def test_generate_blog_data_contributor_columns(tmp_path):
             'labels': [],
             'body': 'Some body text',
         },
-    ]
-    generator.jira_hierarchy = {}
+    ])
 
     generator.generate_blog_data(str(tmp_path))
 
@@ -193,7 +189,7 @@ def test_generate_blog_data_contributor_columns(tmp_path):
 
 
 @patch.dict('os.environ', {'GITHUB_TOKEN': 'fake-token'})
-def test_generate_blog_data_no_hypershift_in_output(tmp_path):
+def test_generate_blog_data_no_hypershift_in_output(tmp_path, make_generator):
     """Verify no HyperShift-specific text in blog_data.json with custom config."""
     from chronicler.config import ChroniclerConfig, RepoConfig, BlogConfig, NoTeamConfig, JiraConfig
 
@@ -211,14 +207,7 @@ def test_generate_blog_data_no_hypershift_in_output(tmp_path):
         ),
     )
 
-    generator = PRReportGenerator(
-        since_date="2026-08-01",
-        end_date="2026-08-31",
-        output_dir=str(tmp_path),
-        config=custom_config,
-    )
-    generator.prs = []
-    generator.jira_hierarchy = {}
+    generator = make_generator(custom_config)
 
     generator.generate_blog_data(str(tmp_path))
 
