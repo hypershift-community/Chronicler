@@ -4,12 +4,11 @@
 import json
 import pytest
 from unittest.mock import patch, MagicMock
-from chronicler.app import BLOG_PROMPT_TEMPLATE, fetch_model_pricing
+from chronicler.app import BLOG_PROMPT_TEMPLATE, PRReportGenerator, fetch_model_pricing
 
 
-def test_blog_prompt_template_renders_without_errors():
-    """Verify BLOG_PROMPT_TEMPLATE renders successfully with all required placeholders."""
-    # Dummy/placeholder values for all format parameters
+def _make_template_params(**overrides):
+    """Build a default template params dict, applying any overrides."""
     params = {
         'project_name': 'TestProject',
         'aggregated_path': '/tmp/pr_deep_aggregated.json',
@@ -20,7 +19,15 @@ def test_blog_prompt_template_renders_without_errors():
         'pr_count': 42,
         'contributor_count': 15,
         'blog_filename': '2026-07-progress-report.md',
+        'blog_output_dir': 'docs/content/blog',
     }
+    params.update(overrides)
+    return params
+
+
+def test_blog_prompt_template_renders_without_errors():
+    """Verify BLOG_PROMPT_TEMPLATE renders successfully with all required placeholders."""
+    params = _make_template_params()
 
     # Render the template
     result = BLOG_PROMPT_TEMPLATE.format(**params)
@@ -45,6 +52,7 @@ def test_blog_prompt_template_renders_without_errors():
     assert '42' in result, "pr_count placeholder not replaced"
     assert '15' in result, "contributor_count placeholder not replaced"
     assert '2026-07-progress-report.md' in result, "blog_filename placeholder not replaced"
+    assert 'docs/content/blog' in result, "blog_output_dir placeholder not replaced"
 
 
 def test_blog_prompt_template_contains_required_instructions():
@@ -73,6 +81,145 @@ def test_blog_prompt_template_contains_required_instructions():
     assert 'Sensitive Content Filtering' in BLOG_PROMPT_TEMPLATE
     assert 'SFDC case' in BLOG_PROMPT_TEMPLATE
     assert 'compliance' in BLOG_PROMPT_TEMPLATE
+
+
+def test_blog_prompt_template_uses_custom_project_name():
+    """Verify rendered template uses the custom project name, not 'HyperShift'."""
+    params = _make_template_params(project_name='Karpenter', blog_output_dir='site/blog')
+    result = BLOG_PROMPT_TEMPLATE.format(**params)
+
+    # Project name should appear (from placeholder)
+    assert 'Karpenter' in result, "Custom project name not found in rendered template"
+    # No hardcoded HyperShift text should remain
+    assert 'HyperShift' not in result, "Hardcoded 'HyperShift' found in rendered template"
+
+
+def test_blog_prompt_template_uses_custom_output_dir():
+    """Verify rendered template uses blog_output_dir, not hardcoded 'docs/content/blog'."""
+    params = _make_template_params(
+        blog_output_dir='custom/blog/output',
+        template_path='custom/blog/template.md',
+        blog_filename='2026-08-progress-report.md',
+    )
+    result = BLOG_PROMPT_TEMPLATE.format(**params)
+
+    # The custom output dir should appear in the output file path
+    assert 'custom/blog/output/2026-08-progress-report.md' in result, \
+        "Blog output path not using blog_output_dir"
+    # Navigation update instruction should also use the custom dir
+    assert 'custom/blog/output/index.md' in result, \
+        "Navigation index path not using blog_output_dir"
+
+
+def test_blog_prompt_template_no_hardcoded_blog_path():
+    """Verify the raw template has no hardcoded 'docs/content/blog' paths."""
+    # The raw template should only contain {blog_output_dir} placeholders,
+    # not hardcoded docs/content/blog paths
+    assert 'docs/content/blog' not in BLOG_PROMPT_TEMPLATE, \
+        "Template contains hardcoded 'docs/content/blog' path — should use {blog_output_dir}"
+
+
+@pytest.fixture
+def make_generator(tmp_path):
+    """Create a PRReportGenerator with standard test dates and empty state."""
+    def _factory(config, prs=None):
+        generator = PRReportGenerator(
+            since_date="2026-08-01",
+            end_date="2026-08-31",
+            output_dir=str(tmp_path),
+            config=config,
+        )
+        generator.prs = prs or []
+        generator.jira_hierarchy = {}
+        return generator
+    return _factory
+
+
+@patch.dict('os.environ', {'GITHUB_TOKEN': 'fake-token'})
+def test_generate_blog_data_contributor_columns(tmp_path, make_generator):
+    """Verify generate_blog_data dynamically generates contributor columns from config repos."""
+    from chronicler.config import ChroniclerConfig, RepoConfig, BlogConfig, NoTeamConfig
+
+    custom_config = ChroniclerConfig(
+        project_name="TestProject",
+        repos=[
+            RepoConfig(name="myorg/alpha", filter="all"),
+            RepoConfig(name="myorg/beta", filter="all"),
+        ],
+        team=NoTeamConfig(),
+        blog=BlogConfig(output_dir="custom/blog"),
+    )
+
+    generator = make_generator(custom_config, prs=[
+        {
+            'repo': 'myorg/alpha',
+            'number': 1,
+            'title': 'Fix thing',
+            'url': 'https://github.com/myorg/alpha/pull/1',
+            'author': 'alice',
+            'createdAt': '2026-08-15T00:00:00Z',
+            'mergedAt': '2026-08-15T12:00:00Z',
+            'readyAt': '2026-08-15T00:00:00Z',
+            'wasDraft': False,
+            'draftToReadyHours': None,
+            'readyToMergeHours': 12.0,
+            'reviewers': ['bob'],
+            'approvers': ['bob'],
+            'jiraTickets': [],
+            'labels': [],
+            'body': 'Some body text',
+        },
+    ])
+
+    generator.generate_blog_data(str(tmp_path))
+
+    blog_data_path = tmp_path / 'blog_data.json'
+    assert blog_data_path.exists(), "blog_data.json was not created"
+
+    with open(blog_data_path) as f:
+        data = json.load(f)
+
+    # Contributor table should have columns for the configured repos
+    contrib_table = data['markdown']['contributor_table']
+    assert 'alpha' in contrib_table, "Column for 'alpha' repo missing"
+    assert 'beta' in contrib_table, "Column for 'beta' repo missing"
+    # Should NOT contain HyperShift-specific repo names
+    assert 'hypershift' not in contrib_table.lower(), \
+        "Contributor table contains hardcoded 'hypershift' column"
+
+
+@patch.dict('os.environ', {'GITHUB_TOKEN': 'fake-token'})
+def test_generate_blog_data_no_hypershift_in_output(tmp_path, make_generator):
+    """Verify no HyperShift-specific text in blog_data.json with custom config."""
+    from chronicler.config import ChroniclerConfig, RepoConfig, BlogConfig, NoTeamConfig, JiraConfig
+
+    custom_config = ChroniclerConfig(
+        project_name="Karpenter",
+        repos=[
+            RepoConfig(name="karpenter/core", filter="all"),
+        ],
+        team=NoTeamConfig(),
+        blog=BlogConfig(output_dir="site/posts"),
+        jira=JiraConfig(
+            ticket_prefixes=["KARP"],
+            grouping_prefix="KARP",
+            bug_prefix="KARP",
+        ),
+    )
+
+    generator = make_generator(custom_config)
+
+    generator.generate_blog_data(str(tmp_path))
+
+    blog_data_path = tmp_path / 'blog_data.json'
+    with open(blog_data_path) as f:
+        raw_content = f.read()
+
+    # No HyperShift-specific text should appear in the output
+    assert 'hypershift' not in raw_content.lower(), \
+        "blog_data.json contains 'hypershift' text with custom config"
+    assert 'HyperShift' not in raw_content, \
+        "blog_data.json contains 'HyperShift' text with custom config"
 
 
 def test_fetch_model_pricing_returns_dict():
