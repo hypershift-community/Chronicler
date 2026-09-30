@@ -58,12 +58,69 @@ uv run chronicler
 
 # Report for a specific date range
 uv run chronicler 2026-07-01 --end 2026-07-31 --output-dir ~/reports/july
+```
 
-# Full pipeline: fetch → select → analyze → blog
+### Full TUI pipeline
+
+For a fully featured blog post (like the ones on
+[hypershift.pages.dev/blog](https://hypershift.pages.dev/blog/)), run the
+complete pipeline:
+
+```bash
 uv run chronicler 2026-07-01 --end 2026-07-31 \
     --output-dir ~/reports/july \
-    --resume --select --analyze --blog-data --blog
+    --select --analyze --blog-data --blog
 ```
+
+This walks through six phases in a single Textual TUI window:
+
+1. **Fetch PRs** — scans all configured repos via GitHub GraphQL
+2. **Jira hierarchy** — resolves ticket → epic → feature chains
+3. **Generate reports** — writes the data report, summary JSON, and blog data
+4. **Interactive selection** — a `DataTable` screen where you tag each PR:
+   - **D** (Deep) — fetch diff + full LLM analysis
+   - **Z** (Lazy) — fetch diff now, metadata-only LLM analysis (diff on disk
+     for the blog agent to reference later)
+   - **M** (Metadata) — no diff, LLM analyzes PR description only
+   - **I** (Ignore) — skip entirely
+5. **Fetch diffs** — downloads patches for Deep + Lazy PRs
+6. **LLM analysis** — Claude Sonnet reviews each selected PR, writes
+   per-PR analysis files, and produces `pr_deep_aggregated.json`
+
+Once data generation finishes, `--blog` launches a coding agent (default:
+[pi](https://github.com/earendil-works/pi)) with a structured prompt that
+guides story selection and blog writing.
+
+### Running examples
+
+```bash
+# 1. Full pipeline: data generation + blog writing in one go
+uv run chronicler 2026-07-01 --end 2026-07-31 \
+    --output-dir ~/reports/july \
+    --select --analyze --blog-data --blog
+
+# 2. Resume blog writing (data already generated)
+#    Skips the entire pipeline — launches the agent in under a second
+uv run chronicler 2026-07-01 --end 2026-07-31 \
+    --output-dir ~/reports/july \
+    --blog
+
+# 3. Use a different coding agent for blog writing
+uv run chronicler 2026-07-01 --end 2026-07-31 \
+    --output-dir ~/reports/july \
+    --blog --blog-agent claude
+```
+
+Step 2 works because `--blog` on its own detects the cached
+`pr_deep_aggregated.json` and `blog_data.json` in the output directory and
+skips straight to the agent. To force a full regeneration, add the data flags
+back (`--select --analyze --blog-data`).
+
+The default agent can also be set in config:
+
+```toml
+[blog]
+agent = "pi"   # or "claude"
 
 ## CLI reference
 
@@ -78,10 +135,11 @@ chronicler [since_date] [OPTIONS]
 | `--config PATH` | Path to TOML config file (default: platform-specific, see below) |
 | `--output-dir DIR` | Directory for output files (default: `/tmp`) |
 | `--resume` | Skip re-fetching repos that succeeded on a previous run |
-| `--select` | Launch interactive TUI for PR categorisation (D=Deep, L=Light, I=Ignore) |
+| `--select` | Launch interactive TUI for PR categorisation (D=Deep, Z=Lazy, M=Metadata, I=Ignore) |
 | `--analyze` | Run LLM analysis on selected PRs via Claude Sonnet |
 | `--blog-data` | Generate `blog_data.json` with contributor tables and metrics |
-| `--blog` | Exec into a clean Claude Code session for blog writing |
+| `--blog` | Launch a coding agent for blog writing (skips pipeline if data exists) |
+| `--blog-agent CMD` | Coding agent command (default: from config, or `pi`) |
 | `--score` | Output ranked PR list by importance |
 | `--score-limit N` | Number of PRs in scored output (default: 20) |
 | `--deep PR [PR ...]` | Fetch diffs for specific PRs (`owner/repo#number` format) |
@@ -152,6 +210,7 @@ vertex_region = "us-east5"
 [blog]
 output_dir = "docs/content/blog"
 format = "mkdocs-material"
+agent = "pi"                          # coding agent for --blog (e.g. pi, claude)
 ```
 
 ## Environment variables

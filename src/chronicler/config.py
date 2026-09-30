@@ -120,6 +120,7 @@ class LlmConfig:
 class BlogConfig:
     output_dir: str = _f("docs/content/blog", "Directory for generated blog posts")
     format: str = _f("mkdocs-material", "Blog output format")
+    agent: str = _f("pi", "Coding agent command for blog writing (e.g. pi, claude)")
 
 
 def _default_repos() -> List[RepoConfig]:
@@ -335,6 +336,7 @@ def _build_config(data: dict) -> ChroniclerConfig:
     blog = BlogConfig(
         output_dir=blog_raw.get("output_dir", BlogConfig.output_dir),
         format=blog_raw.get("format", BlogConfig.format),
+        agent=blog_raw.get("agent", BlogConfig.agent),
     )
 
     return ChroniclerConfig(

@@ -2957,7 +2957,13 @@ PR format: owner/repo#number (e.g., org/repo#123)
     parser.add_argument(
         '--blog',
         action='store_true',
-        help='After data generation, exec into a clean Claude Code session for blog writing'
+        help='After data generation, exec into a coding agent session for blog writing'
+    )
+    parser.add_argument(
+        '--blog-agent',
+        default=None,
+        metavar='CMD',
+        help='Coding agent command to use for blog writing (default: from config, or pi)'
     )
     return parser.parse_args()
 
@@ -2979,7 +2985,24 @@ async def main():
 
     generator = PRReportGenerator(since_date, end_date, output_dir=output_dir, config=config)
 
-    if args.select:
+    # Fast path: if --blog is the only action and required files exist, skip the pipeline
+    data_flags = args.select or args.score or args.deep or args.analyze or args.blog_data
+    if args.blog and not data_flags:
+        aggregated_path = os.path.join(output_dir, 'pr_deep_aggregated.json')
+        blog_data_path = os.path.join(output_dir, 'blog_data.json')
+        if os.path.exists(aggregated_path) and os.path.exists(blog_data_path):
+            print("Blog data already exists, skipping pipeline. "
+                  "Add --select/--analyze/--blog-data to regenerate.")
+        else:
+            print("Blog data not found, running full pipeline first...")
+            # Fall through to headless mode, generating what's missing
+            args.blog_data = not os.path.exists(blog_data_path)
+            # Can't generate aggregated analysis without --select or --deep
+            if not os.path.exists(aggregated_path):
+                print(f"Error: {aggregated_path} not found. "
+                      "Run with --select --analyze first.")
+                sys.exit(1)
+    elif args.select:
         # TUI mode: full pipeline in a single Textual app window
         app = PipelineApp(generator, args)
         result = await app.run_async()
@@ -3006,7 +3029,7 @@ async def main():
         if args.analyze:
             print("Analyze mode: will run LLM analysis on PR diffs")
         if args.blog:
-            print("Blog mode: will exec into Claude Code for blog writing after data generation")
+            print("Blog mode: will exec into coding agent for blog writing after data generation")
         print()
 
         await generator.fetch_all_prs(resume=args.resume)
@@ -3125,12 +3148,13 @@ async def main():
             blog_output_dir=blog_output_dir,
         )
 
-        print(f"Launching Claude Code for blog writing...")
+        agent = args.blog_agent or config.blog.agent
+        print(f"Launching {agent} for blog writing...")
         print(f"  Aggregated analysis: {aggregated_path}")
         print(f"  Blog data: {blog_data_path}")
         print(f"  Style reference: {template_path}")
 
-        os.execvp('claude', ['claude', prompt])
+        os.execvp(agent, [agent, prompt])
 
 
 def cli():
